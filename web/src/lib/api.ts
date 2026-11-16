@@ -8,8 +8,10 @@ export class ApiError extends Error {
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = { 'X-Requested-With': 'offbook' };
-  if (body !== undefined) headers['Content-Type'] = 'application/json';
-  const r = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  // a FormData body (file upload) must set its own multipart Content-Type, boundary included
+  const form = body instanceof FormData;
+  if (body !== undefined && !form) headers['Content-Type'] = 'application/json';
+  const r = await fetch(path, { method, headers, body: body === undefined ? undefined : form ? body : JSON.stringify(body) });
   if (r.status === 401 && !path.startsWith('/api/login')) {
     const next = location.pathname + location.search;
     await goto(`/login?next=${encodeURIComponent(next)}`);
@@ -32,6 +34,7 @@ export const api = {
   get: <T>(path: string) => request<T>('GET', path),
   post: <T>(path: string, body: unknown = {}) => request<T>('POST', path, body),
   patch: <T>(path: string, body: unknown) => request<T>('PATCH', path, body),
+  upload: <T>(path: string, form: FormData) => request<T>('POST', path, form),
   del: <T>(path: string) => request<T>('DELETE', path)
 };
 

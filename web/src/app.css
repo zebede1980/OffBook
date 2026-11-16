@@ -11,6 +11,7 @@
   --radius: 14px;
   --shadow: 0 1px 2px rgb(0 0 0 / 0.06), 0 2px 8px rgb(0 0 0 / 0.05);
   --tabbar-h: 0px;
+  --cast-l: 38%;
   --font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   color-scheme: light;
 }
@@ -24,6 +25,7 @@
     --line: #432d36;
     --accent: #f08ba3;
     --accent-ink: #2a0f18;
+    --cast-l: 72%;
     --danger: #ff8a80;
     --shadow: 0 1px 2px rgb(0 0 0 / 0.4);
     color-scheme: dark;
