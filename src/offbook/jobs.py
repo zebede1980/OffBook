@@ -133,8 +133,8 @@ class Worker:
 
 
 def _load_handlers() -> None:
-    """Import the modules whose @handler functions the worker needs. None yet: the first arrive with script
-    ingest (Stage 1)."""
+    # Importing registers the handlers via @handler.
+    from offbook import scripts  # noqa: F401
 
 
 def job_out(r: sqlite3.Row) -> dict:

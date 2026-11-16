@@ -6,6 +6,8 @@ so there is no migrations table to keep in step.
 
 import re
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,6 +29,18 @@ def connect(path: Path | str) -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
     return conn
+
+
+@contextmanager
+def tx(conn: sqlite3.Connection) -> Iterator[None]:
+    """Group several statements into one transaction (connections are otherwise in autocommit mode)."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def _migrations() -> list[tuple[int, Path]]:

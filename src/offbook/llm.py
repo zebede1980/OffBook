@@ -31,6 +31,10 @@ class Truncated(LLMError):
     """The reply hit max_tokens. Re-asking with the same budget would fail the same way."""
 
 
+class CapReached(LLMError):
+    """Today's call budget is spent. Nothing more will work until tomorrow."""
+
+
 def image_part(data: bytes, mime: str) -> dict:
     """A message content part carrying an image inline, in the OpenAI `image_url` data-URL form."""
     return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}}
@@ -63,7 +67,7 @@ def call_llm(conn: sqlite3.Connection, s: Settings, *, purpose: str, model: str,
              profile_id: int | None = None, temperature: float = 0.0, max_tokens: int = 2500) -> str:
     cap = int(os.environ.get("LLM_DAILY_CAP", DAILY_CAP_DEFAULT))
     if calls_today(conn) >= cap:
-        raise LLMError(f"daily AI call cap ({cap}) reached")
+        raise CapReached(f"daily AI call cap ({cap}) reached")
     t0 = time.monotonic()
     usage: dict = {}
     try:
