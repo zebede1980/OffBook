@@ -1,0 +1,25 @@
+services:
+  web:
+    build: .
+    container_name: offbook
+    image: offbook:latest
+    init: true                      # tini as PID 1, so `docker stop` signals reach Python
+    env_file: .env
+    environment:
+      OFFBOOK_SECURE_COOKIES: "1"   # nginx terminates TLS, so cookies are HTTPS-only
+      KOKORO_URL: http://kokoro-tts:8880
+    volumes:
+      - ./data:/data
+    ports:
+      # Host-only, for direct checks. nginx reaches it as offbook:8000 over nginx-proxy-nw.
+      - "127.0.0.1:8091:8000"
+    networks:
+      - nginx-proxy-nw
+      - character-generator-network   # where the kokoro-tts container lives (CardGenV2's compose)
+    restart: unless-stopped
+
+networks:
+  nginx-proxy-nw:
+    external: true
+  character-generator-network:
+    external: true

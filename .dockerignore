@@ -1,0 +1,11 @@
+.venv
+data
+__pycache__
+.pytest_cache
+.env
+.git
+tests
+spike
+web/node_modules
+web/build
+web/.svelte-kit
