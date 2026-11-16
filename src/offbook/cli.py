@@ -91,6 +91,42 @@ def cmd_parse_spike(args):
     print(f"\ncast: {', '.join(known) or '(none)'}\nJSON written to {out_dir.resolve()}")
 
 
+DEMO = [  # the opening of Wilde's "The Importance of Being Earnest" (1895, public domain)
+    ("heading", None, "FIRST ACT"),
+    ("direction", None, "Morning-room in Algernon's flat in Half-Moon Street. The sound of a piano is heard in the "
+                        "adjoining room. Lane is arranging afternoon tea on the table."),
+    ("dialogue", "ALGERNON", "Did you hear what I was playing, Lane?"),
+    ("dialogue", "LANE", "I didn't think it polite to listen, sir."),
+    ("dialogue", "ALGERNON", "I'm sorry for that, for your sake. I don't play accurately - any one can play "
+                             "accurately - but I play with wonderful expression. As far as the piano is concerned, "
+                             "sentiment is my forte. I keep science for Life."),
+    ("dialogue", "LANE", "Yes, sir."),
+    ("dialogue", "ALGERNON", "And, speaking of the science of Life, have you got the cucumber sandwiches cut for "
+                             "Lady Bracknell?"),
+    ("dialogue", "LANE", "Yes, sir. [Hands them on a salver.]"),
+    ("dialogue", "ALGERNON", "[Inspects them, takes two, and goes over to the sofa.] Oh! ... by the way, Lane, I see "
+                             "from your book that on Thursday night, when Lord Shoreman and Mr. Worthing were dining "
+                             "with me, eight bottles of champagne are entered as having been consumed."),
+    ("dialogue", "LANE", "Yes, sir; eight bottles and a pint."),
+    ("dialogue", None, "Why is it that at a bachelor's establishment the servants invariably drink the champagne?"),
+]
+
+
+def cmd_dev_seed(args):
+    """A small public-domain scene for trying the screens without paying to read photos. It includes the things
+    the review screen has to flag: a word the reader was unsure of, and a speech with no speaker."""
+    from offbook import scripts
+
+    _, conn = _open()
+    with db.tx(conn):
+        script_id = scripts.create_script(conn, "The Importance of Being Earnest (demo)", None)
+        for n, (kind, who, text) in enumerate(DEMO):
+            scripts.insert_line(conn, script_id, n, kind, text,
+                                speakers=[scripts.character_for(conn, script_id, who)] if who else None,
+                                highlighted=who == "LANE", unsure=["Shoreman"] if "Shoreman" in text else None)
+    print(f"demo script created (id {script_id})")
+
+
 def cmd_serve(args):
     import uvicorn
 
@@ -115,6 +151,8 @@ def main(argv=None):
     sp.set_defaults(fn=cmd_set_password)
 
     sub.add_parser("check", help="report database, password, AI key and Kokoro status").set_defaults(fn=cmd_check)
+
+    sub.add_parser("dev-seed", help="add a small public-domain demo script").set_defaults(fn=cmd_dev_seed)
 
     sp = sub.add_parser("parse-spike", help="read page photos with the vision model and print the result (PAID)")
     sp.add_argument("images", nargs="+", help="page photos, in script order")
