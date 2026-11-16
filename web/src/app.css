@@ -1,0 +1,58 @@
+:root {
+  --bg: #f7f1e8;
+  --surface: #fffdf9;
+  --surface-2: #efe6d8;
+  --text: #2a1620;
+  --muted: #74636a;
+  --line: #e0d4c2;
+  --accent: #a52f4b;
+  --accent-ink: #ffffff;
+  --danger: #b3261e;
+  --radius: 14px;
+  --shadow: 0 1px 2px rgb(0 0 0 / 0.06), 0 2px 8px rgb(0 0 0 / 0.05);
+  --tabbar-h: 0px;
+  --font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1a1014;
+    --surface: #25171d;
+    --surface-2: #301f26;
+    --text: #f3e8e2;
+    --muted: #b09ea4;
+    --line: #432d36;
+    --accent: #f08ba3;
+    --accent-ink: #2a0f18;
+    --danger: #ff8a80;
+    --shadow: 0 1px 2px rgb(0 0 0 / 0.4);
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 17px; line-height: 1.45; -webkit-text-size-adjust: 100%; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+h1, h2, h3 { line-height: 1.2; margin: 0 0 0.5em; }
+h1 { font-size: 1.6rem; }
+h2 { font-size: 1.2rem; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 0.4em; min-height: 48px; padding: 0 1.1rem; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+.btn.danger { color: var(--danger); }
+.btn.small { min-height: 36px; padding: 0 0.7rem; font-size: 0.9rem; }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.btn.ghost { background: transparent; border-color: transparent; }
+input[type='text'], input[type='password'], textarea, select {
+  width: 100%; min-height: 48px; padding: 0.55rem 0.75rem; border-radius: 12px; border: 1px solid var(--line); background: var(--surface);
+}
+label { display: block; font-size: 0.9rem; color: var(--muted); margin: 0.75rem 0 0.25rem; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+.muted { color: var(--muted); }
+.small { font-size: 0.85rem; }
+.row { display: flex; gap: 0.5rem; align-items: center; }
+.spacer { flex: 1; }
+.page { padding: 1rem; max-width: 760px; margin: 0 auto; }
+.empty { text-align: center; padding: 2.5rem 1rem; color: var(--muted); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
