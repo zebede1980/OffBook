@@ -1,0 +1,130 @@
+import argparse
+import getpass
+import json
+import logging
+import mimetypes
+import sys
+from pathlib import Path
+
+from offbook import config, db
+
+
+def _open():
+    s = config.load()
+    conn = db.connect(s.db_path)
+    db.migrate(conn)
+    return s, conn
+
+
+def _ask_password(prompt: str, from_stdin: bool = False) -> str:
+    if from_stdin:
+        return sys.stdin.readline().rstrip("\r\n")
+    pw = getpass.getpass(prompt)
+    if pw != getpass.getpass("again: "):
+        raise SystemExit("passwords did not match")
+    return pw
+
+
+def cmd_set_password(args):
+    from offbook import auth
+
+    _, conn = _open()
+    try:
+        auth.set_family_password(conn, _ask_password("family password: ", args.password_stdin))
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+    print("family password set (every device is now signed out)")
+
+
+def cmd_check(args):
+    """What a deploy needs to know: is the database there, is there a password, can we reach Kokoro."""
+    import httpx
+
+    from offbook import auth
+
+    s, conn = _open()
+    print(f"data dir     {s.data_dir}")
+    print(f"schema       v{db.schema_version(conn)}")
+    print(f"password     {'set' if auth.family_hash(conn) else 'NOT SET - run: offbook set-password'}")
+    print(f"profiles     {conn.execute('SELECT COUNT(*) FROM profile').fetchone()[0]}")
+    print(f"nanogpt key  {'set' if s.nanogpt_api_key else 'NOT SET'} (model {s.parse_model})")
+    try:
+        r = httpx.get(f"{s.kokoro_url.rstrip('/')}/v1/audio/voices", timeout=10)
+        r.raise_for_status()
+        print(f"kokoro       ok, {len(r.json().get('voices', []))} voices at {s.kokoro_url}")
+    except Exception as e:
+        print(f"kokoro       UNREACHABLE at {s.kokoro_url}: {type(e).__name__}: {e}")
+        raise SystemExit(1)
+
+
+def cmd_parse_spike(args):
+    """Stage 0 gate: read real page photos and show what the model makes of them. Each page is a paid AI call."""
+    from offbook import parse
+
+    s, conn = _open()
+    model = args.model or s.parse_model
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    known: list[str] = []
+    for path in map(Path, args.images):
+        mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+        before = conn.execute("SELECT COALESCE(MAX(call_id), 0) FROM llm_call").fetchone()[0]
+        try:
+            page = parse.parse_page(conn, s, path.read_bytes(), mime, known, model=model)
+        except Exception as e:
+            print(f"{path.name}: FAILED {type(e).__name__}: {e}")
+            continue
+        known = list(dict.fromkeys(known + parse.speakers_in(page)))
+        (out_dir / f"{path.stem}.json").write_text(json.dumps(page, indent=1, ensure_ascii=False), encoding="utf-8")
+        calls = conn.execute("SELECT prompt_tokens, completion_tokens, duration_ms FROM llm_call WHERE call_id > ?",
+                             (before,)).fetchall()
+        tok_in, tok_out = (sum(c[i] or 0 for c in calls) for i in (0, 1))
+        print(f"\n=== {path.name}: page {page['page_number']}, {len(page['items'])} items, {len(calls)} call(s), "
+              f"{tok_in} in / {tok_out} out tokens, {sum(c[2] or 0 for c in calls) / 1000:.1f}s")
+        for it in page["items"]:
+            if it["kind"] == "dialogue":
+                flags = "".join(f" [{f}]" for f in ("continues", "highlighted") if it[f])
+                flags += f" [unsure: {', '.join(it['unsure'])}]" if it["unsure"] else ""
+                print(f"  {' & '.join(it['speakers']) or '?'}:{flags} {it['text']}")
+            else:
+                print(f"  ({it['kind']}) {it['text']}")
+    print(f"\ncast: {', '.join(known) or '(none)'}\nJSON written to {out_dir.resolve()}")
+
+
+def cmd_serve(args):
+    import uvicorn
+
+    # One worker only: the job thread lives in this process and must not be duplicated.
+    uvicorn.run("offbook.api.app:create_app", factory=True, host=args.host, port=args.port, workers=1,
+                proxy_headers=True, forwarded_allow_ips="*")
+
+
+def main(argv=None):
+    config.load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    p = argparse.ArgumentParser(prog="offbook")
+    sub = p.add_subparsers(required=True)
+
+    sp = sub.add_parser("serve")
+    sp.add_argument("--host", default="0.0.0.0")
+    sp.add_argument("--port", type=int, default=8000)
+    sp.set_defaults(fn=cmd_serve)
+
+    sp = sub.add_parser("set-password", help="set the shared family password (prompts)")
+    sp.add_argument("--password-stdin", action="store_true", help="read the password from stdin (for scripts)")
+    sp.set_defaults(fn=cmd_set_password)
+
+    sub.add_parser("check", help="report database, password, AI key and Kokoro status").set_defaults(fn=cmd_check)
+
+    sp = sub.add_parser("parse-spike", help="read page photos with the vision model and print the result (PAID)")
+    sp.add_argument("images", nargs="+", help="page photos, in script order")
+    sp.add_argument("--model", help="model id; default PARSE_MODEL")
+    sp.add_argument("--out", default="spike", help="folder for the JSON results")
+    sp.set_defaults(fn=cmd_parse_spike)
+
+    args = p.parse_args(argv)
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
