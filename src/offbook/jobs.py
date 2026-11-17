@@ -107,6 +107,14 @@ class Worker:
     def start(self) -> None:
         conn = db.connect(self.s.db_path)
         n = requeue_stale(conn)
+        _load_handlers()
+        from offbook import audio
+        try:
+            queued = audio.sync_all(conn, self.s)
+            if queued:
+                log.info("queued %d missing voice clips", queued)
+        except Exception:
+            log.exception("could not check for missing voice clips")
         conn.close()
         if n:
             log.info("re-queued %d interrupted jobs", n)

@@ -132,3 +132,27 @@ def test_levelling_brings_quiet_and_loud_clips_together(monkeypatch):
     assert abs(float(a["input_i"]) - sound.TARGET_LUFS) < 2
     # silence can't be measured, but still comes out as audio
     assert sound.level(_tone_wav(0.0, 0.5))
+
+
+def test_progress_queues_audio_that_was_never_queued(kid, scene, conn, settings):
+    # as after an upgrade that changes how clips are made: the clips this script needs simply don't exist yet
+    conn.execute("DELETE FROM job")
+    conn.execute("DELETE FROM clip")
+    p = kid.get(f"/api/scripts/{scene['id']}/audio").json()
+    assert p["pending"] == 2
+    jobs.run_pending(conn, settings)
+    assert kid.get(f"/api/scripts/{scene['id']}/audio").json()["ready"] == 2
+
+
+def test_startup_sync_queues_everything_missing(kid, scene, conn, settings):
+    conn.execute("DELETE FROM job")
+    conn.execute("DELETE FROM clip")
+    assert audio.sync_all(conn, settings) == 2
+
+
+def test_progress_checks_do_not_retry_failures_forever(kid, scene, conn, settings, fake_tts):
+    fake_tts.broken = True
+    jobs.run_pending(conn, settings)
+    for _ in range(3):
+        assert kid.get(f"/api/scripts/{scene['id']}/audio").json()["failed"] == 2
+    assert jobs.run_pending(conn, settings) == 0

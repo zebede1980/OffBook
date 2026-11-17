@@ -109,13 +109,13 @@ def line_clips(conn: sqlite3.Connection, s: Settings, script_id: int) -> dict[in
     return out
 
 
-def ensure_clip(conn: sqlite3.Connection, c: dict, priority: int | None = None) -> bool:
+def ensure_clip(conn: sqlite3.Connection, c: dict, priority: int | None = None, retry_failed: bool = True) -> bool:
     """Make sure this clip exists or is on its way. Returns True if it was (re)queued."""
     row = conn.execute("SELECT status FROM clip WHERE clip_hash = ?", (c["hash"],)).fetchone()
     if row is None:
         conn.execute("INSERT INTO clip(clip_hash, engine, voice, speed, text, created_at) VALUES (?,?,?,?,?,?)",
                      (c["hash"], c["engine"], c["voice"], c["speed"], c["text"], now_utc()))
-    elif row["status"] == "failed":
+    elif row["status"] == "failed" and retry_failed:
         conn.execute("UPDATE clip SET status = 'queued', error = NULL WHERE clip_hash = ?", (c["hash"],))
     else:
         return False
@@ -123,10 +123,22 @@ def ensure_clip(conn: sqlite3.Connection, c: dict, priority: int | None = None) 
     return True
 
 
-def sync_clips(conn: sqlite3.Connection, s: Settings, script_id: int) -> int:
+def sync_clips(conn: sqlite3.Connection, s: Settings, script_id: int, retry_failed: bool = True) -> int:
     """Queue any audio this script needs and doesn't have. Call after anything that changes lines or voices.
-    Clips are queued in script order, so the opening scene is ready first."""
-    return sum(ensure_clip(conn, c) for c in line_clips(conn, s, script_id).values())
+    Clips are queued in script order, so the opening scene is ready first. With retry_failed=False, clips that
+    already failed are left alone (so a check that runs every few seconds can't retry a broken engine forever)."""
+    return sum(ensure_clip(conn, c, retry_failed=retry_failed) for c in line_clips(conn, s, script_id).values())
+
+
+def sync_all(conn: sqlite3.Connection, s: Settings) -> int:
+    """At startup: queue whatever any script is missing (after an upgrade that changes how clips are made, say)."""
+    n = 0
+    for (script_id,) in conn.execute("SELECT script_id FROM script").fetchall():
+        try:
+            n += sync_clips(conn, s, script_id, retry_failed=False)
+        except tts.TTSError as e:
+            log.warning("could not check audio for script %s: %s", script_id, e)
+    return n
 
 
 def hurry(conn: sqlite3.Connection, clip_hash_: str) -> None:
@@ -146,7 +158,8 @@ def seconds_per_clip(conn: sqlite3.Connection) -> float:
 
 def progress(conn: sqlite3.Connection, s: Settings, script_id: int) -> dict:
     """How much of a script's audio is ready, and roughly how long the rest will take (including any other
-    script's audio queued ahead of it)."""
+    script's audio queued ahead of it). Anything missing altogether is queued, so the figures always move."""
+    sync_clips(conn, s, script_id, retry_failed=False)
     clips = line_clips(conn, s, script_id)
     hashes = [c["hash"] for c in clips.values()]
     status: dict[str, str] = {}
