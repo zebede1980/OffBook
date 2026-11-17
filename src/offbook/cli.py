@@ -48,12 +48,26 @@ def cmd_check(args):
     print(f"password     {'set' if auth.family_hash(conn) else 'NOT SET - run: offbook set-password'}")
     print(f"profiles     {conn.execute('SELECT COUNT(*) FROM profile').fetchone()[0]}")
     print(f"nanogpt key  {'set' if s.nanogpt_api_key else 'NOT SET'} (model {s.parse_model})")
+    from offbook import tts
+
+    print(f"new scripts  {s.default_engine}")
+    ok = True
+    for name in tts.available(s):
+        try:
+            print(f"{name:<12} ok, {len(tts.engine(s, name).voices())} English voices")
+        except Exception as e:
+            print(f"{name:<12} UNREACHABLE: {type(e).__name__}: {e}")
+            ok = False
+    from offbook import sound
     try:
-        r = httpx.get(f"{s.kokoro_url.rstrip('/')}/v1/audio/voices", timeout=10)
-        r.raise_for_status()
-        print(f"kokoro       ok, {len(r.json().get('voices', []))} voices at {s.kokoro_url}")
-    except Exception as e:
-        print(f"kokoro       UNREACHABLE at {s.kokoro_url}: {type(e).__name__}: {e}")
+        sound.level(b"")
+    except sound.SoundError as e:
+        if "not installed" in str(e):
+            print("ffmpeg       NOT INSTALLED: voice clips can't be made")
+            ok = False
+        else:
+            print("ffmpeg       ok")
+    if not ok:
         raise SystemExit(1)
 
 
@@ -157,6 +171,27 @@ def cmd_import_pages(args):
     print(f"script {script_id} created with {len(batch)} page(s) queued; the server will read them shortly")
 
 
+def cmd_engine(args):
+    """Move scripts to another speech engine (their voices on the old one are kept for switching back)."""
+    from offbook import audio, tts
+
+    s, conn = _open()
+    if args.engine not in tts.available(s):
+        raise SystemExit(f"error: {args.engine} isn't available here (have: {', '.join(tts.available(s))})")
+    ids = [r[0] for r in conn.execute("SELECT script_id FROM script ORDER BY script_id")] if args.all else args.script
+    if not ids:
+        raise SystemExit("error: name script ids, or use --all")
+    for script_id in ids:
+        row = conn.execute("SELECT title, engine FROM script WHERE script_id = ?", (script_id,)).fetchone()
+        if row is None:
+            print(f"script {script_id}: no such script")
+            continue
+        audio.switch_engine(conn, s, script_id, args.engine)
+        p = audio.progress(conn, s, script_id)
+        print(f"script {script_id} {row['title']!r}: {row['engine']} -> {args.engine}, "
+              f"{p['ready']}/{p['total']} clips ready, about {p['eta_seconds'] // 60} min for the rest")
+
+
 def cmd_serve(args):
     import uvicorn
 
@@ -186,6 +221,12 @@ def main(argv=None):
     sp.add_argument("--title", required=True)
     sp.add_argument("images", nargs="+", help="page photos, in script order")
     sp.set_defaults(fn=cmd_import_pages)
+
+    sp = sub.add_parser("engine", help="move scripts to another speech engine")
+    sp.add_argument("engine", choices=["kokoro", "zonos"])
+    sp.add_argument("script", nargs="*", type=int, help="script ids")
+    sp.add_argument("--all", action="store_true", help="every script")
+    sp.set_defaults(fn=cmd_engine)
 
     sub.add_parser("dev-seed", help="add a small public-domain demo script").set_defaults(fn=cmd_dev_seed)
 
