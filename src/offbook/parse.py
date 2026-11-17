@@ -14,36 +14,35 @@ KINDS = ("dialogue", "direction", "heading")
 MAX_ITEMS = 400
 # base64 inflates by a third, and vision APIs commonly reject images over ~5 MB
 MAX_IMAGE_BYTES = 3_500_000
+# a dense two-column page holds ~100 speeches, which is ~5,000 tokens of JSON; leave headroom
+MAX_TOKENS = 14000
 
-SYSTEM = """You are transcribing a photographed page of a play, musical or film script for an app that helps \
-children learn their lines. A child will memorise exactly what you write, so copy the words on the page exactly: \
-never tidy, modernise, correct or complete them.
+SYSTEM = """You are transcribing a photographed page of a play, musical or film script for an app that helps children learn their lines. A child will memorise exactly what you write, so copy the words on the page exactly: never tidy, modernise, correct or complete them.
 
 Return one JSON object and nothing else:
 {"page_number": <the printed page number, or null>, "items": [ ...in reading order... ]}
 
 Each item is one of:
-{"kind": "dialogue", "speakers": ["NAME"], "text": "...", "spoken": "...", "continues": false, "highlighted": false, "unsure": []}
+{"kind": "dialogue", "speakers": ["NAME"], "text": "..."}
 {"kind": "direction", "text": "..."}
 {"kind": "heading", "text": "..."}
 
+A dialogue item may also carry these, but ONLY when they apply. Leave them out otherwise, to keep the reply short:
+"spoken": "..."      the words said aloud, when "text" contains a stage direction that is not spoken
+"continues": true    the page opens mid-speech with no character name above it (the speech began on the last page)
+"highlighted": true  the speech or its character name is marked with a highlighter pen or underlined by hand
+"unsure": ["word"]   words you could not read with confidence (blur, glare, a fold, show-through)
+
 Rules
-- dialogue: one item per speech. "speakers" holds the character name(s) as printed, without "(CONT'D)", "(V.O.)" \
-or similar. A line said by several characters together lists each name; for "ALL" or "BOTH" use that word as the \
-single name.
-- "text" is the speech as printed, including any stage direction inside it, e.g. "(angrily) Get out!".
-- "spoken" is only the words said aloud: the same speech with bracketed or italic stage directions removed, \
-e.g. "Get out!".
-- "continues" is true only when the page opens mid-speech with no character name above it, because the speech \
-began on the previous page. Then "speakers" is your best guess from the known characters, or [].
-- "highlighted" is true when the speech or its character name has been marked with a highlighter pen or \
-underlined by hand.
-- "unsure" lists words in this speech you could not read with confidence (blur, glare, a fold, handwriting over \
-the print). Still give your best reading in "text".
-- direction: stage directions, scene descriptions and anything else not spoken that stands apart from a speech.
-- heading: act and scene titles, song titles.
+- Reading order: if the page has two columns, read the whole left column top to bottom, then the right column.
+- dialogue: one item per speech. "speakers" holds the character name(s) as printed, without the colon and without "(CONT'D)", "(V.O.)" or similar. A line said by several characters together lists each name; for "ALL" or "BOTH" use that word as the single name.
+- "text" is the speech as printed, including a stage direction that sits inside it, e.g. "(angrily) Get out!". Then "spoken" is the same speech without it, e.g. "Get out!".
+- A stage direction that follows a speech on the same line (often in italics, e.g. "Silence.") is not part of the speech: make it its own direction item straight after.
+- For a "continues" speech, "speakers" is your best guess from the known characters, or [].
+- direction: stage directions, scene descriptions and anything else not spoken. These are often in italics and may have no brackets.
+- heading: the play's title, act and scene titles, song titles.
 - Join lines that the page layout wrapped. Keep the author's punctuation and spelling.
-- Leave out running headers, footers, the page number itself and anything handwritten in the margins.
+- Leave out running headers, footers, the page number itself, anything handwritten on the page (names, notes), and faint or mirrored text showing through from the other side of the paper.
 - If the image is not a script page, return {"page_number": null, "items": []}."""
 
 
@@ -119,7 +118,7 @@ def parse_page(conn: sqlite3.Connection, s: Settings, image: bytes, mime: str, k
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": [{"type": "text", "text": cast}, llm.image_part(image, mime)]}]
     return llm.call_json(conn, s, purpose="parse_page", model=model or s.parse_model, messages=messages,
-                         validate=validate_page, profile_id=profile_id, max_tokens=6000, temperature=0.0)
+                         validate=validate_page, profile_id=profile_id, max_tokens=MAX_TOKENS, temperature=0.0)
 
 
 def speakers_in(page: dict) -> list[str]:
