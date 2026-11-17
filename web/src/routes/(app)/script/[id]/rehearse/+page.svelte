@@ -5,6 +5,7 @@
   import { ClipPlayer } from '#lib/rehearsal/clips';
   import { countWords, newState, step, type Verdict } from '#lib/rehearsal/endpoint';
   import { Listener } from '#lib/rehearsal/listener';
+  import { encodeWav } from '#lib/rehearsal/wav';
   import { session } from '#lib/session.svelte';
   import { castHue } from '#lib/text';
   import { errorToast, toast } from '#lib/toast.svelte';
@@ -28,6 +29,13 @@
   let startAt = $state(0);
   let oneScene = $state(false);
   let listen = $state(false);
+  let keep = $state(false);
+  let runId = '';
+  let uploads: Promise<unknown>[] = [];
+  let gettingTakes = $state(false);
+  let takes = $state<{ attempt_id: number; line_id: number | null; expected: string; duration_ms: number; hints: number; has_audio: boolean }[]>([]);
+  let playing: HTMLAudioElement | null = null;
+  const MAX_SAMPLES = 16000 * 110; // a little under the server's two-minute limit
 
   let seq = $state<RehearsalLine[]>([]);
   let idx = $state(0);
@@ -70,6 +78,7 @@
       const saved = JSON.parse(localStorage.getItem('offbook.rehearse') ?? '{}');
       if (views.some((v) => v.id === saved.view)) view = saved.view;
       listen = saved.listen === true;
+      keep = saved.keep === true;
     } catch {
       // no saved preference; the defaults are fine
     }
@@ -80,6 +89,7 @@
   onDestroy(() => {
     gen++;
     ear?.stop();
+    playing?.pause();
     player.close();
     wake?.release().catch(() => {});
     document.removeEventListener('visibilitychange', onVisible);
@@ -120,7 +130,7 @@
     }
     seq = data.lines.slice(startAt, end);
     try {
-      localStorage.setItem('offbook.rehearse', JSON.stringify({ view, listen }));
+      localStorage.setItem('offbook.rehearse', JSON.stringify({ view, listen, keep }));
     } catch {
       // private browsing: nothing to remember, nothing lost
     }
@@ -130,6 +140,9 @@
   /** Start (or restart) playing `seq` from the top. Must be called from a tap. */
   async function begin() {
     await player.unlock(); // must happen inside the tap, or phones stay silent
+    runId = crypto.randomUUID();
+    uploads = [];
+    takes = [];
     if (listen && data?.mine.length && !readMine && !ear) {
       // Not awaited: the permission prompt can sit unanswered, and the scene should start regardless.
       // Until the microphone is ready, turns simply wait for a tap.
@@ -194,24 +207,35 @@
         }
       } else {
         status = 'yourturn';
+        let frames: Float32Array[] = [];
+        let samples = 0;
+        let auto = false;
         if (ear && l.mine) {
           const turn = newState();
           const words = countWords(l.spoken ?? l.text);
           const patience = session.profile?.patience ?? 1;
           hear = 'waiting';
-          ear.onFrame = (prob, ms) => {
+          ear.onFrame = (prob, ms, frame) => {
+            if (keep && samples < MAX_SAMPLES) {
+              frames.push(frame.slice()); // the detector reuses its buffer
+              samples += frame.length;
+            }
             const v = step(turn, prob, ms, words, patience);
             // ~30 frames a second arrive; only touch the screen when something visible changes
             if (v.kind !== hear) hear = v.kind;
             const p = v.kind === 'pausing' ? Math.round(v.progress * 20) / 20 : 0;
             if (p !== progress) progress = p;
-            if (v.kind === 'advance') release();
+            if (v.kind === 'advance') {
+              auto = true;
+              release();
+            }
           };
         }
         await waitForTap();
         // a restart (Back, Pause) has already set up the next turn's listener: leave it alone
         if (my !== gen) return;
         deaf();
+        if (keep && samples > 16000 * 0.3) upload(l, frames, auto ? 'auto' : 'tap', Math.ceil(hint / HINT_STEP));
       }
     }
     if (my === gen) {
@@ -219,7 +243,38 @@
       wake?.release().catch(() => {});
       ear?.stop();
       ear = null;
+      loadTakes();
     }
+  }
+
+  function upload(l: RehearsalLine, frames: Float32Array[], advancedBy: 'auto' | 'tap', hints: number) {
+    const form = new FormData();
+    form.append('audio', encodeWav(frames), 'line.wav');
+    form.append('line_id', String(l.line_id));
+    form.append('run_id', runId);
+    form.append('advanced_by', advancedBy);
+    form.append('hints', String(hints));
+    // in the background: the scene carries on while it uploads
+    uploads.push(api.upload(`/api/attempts`, form).catch(() => {}));
+  }
+
+  async function loadTakes() {
+    if (!keep || !uploads.length) return;
+    gettingTakes = true;
+    await Promise.allSettled(uploads);
+    try {
+      takes = (await api.get<{ attempts: typeof takes }>(`/api/attempts?run_id=${runId}`)).attempts;
+    } catch {
+      // the end screen still works without them
+    } finally {
+      gettingTakes = false;
+    }
+  }
+
+  function playTake(id: number) {
+    playing?.pause();
+    playing = new Audio(`/api/attempts/${id}/audio`);
+    playing.play().catch(() => toast("Couldn't play that recording."));
   }
 
   function next() {
@@ -305,6 +360,9 @@
         <label class="tick"><input type="checkbox" bind:checked={oneScene} /> Stop at the end of that scene</label>
         <label class="tick"><input type="checkbox" bind:checked={readMine} /> Read my lines out too (just listening)</label>
         <label class="tick"><input type="checkbox" bind:checked={listen} disabled={readMine} /> Move on by itself when I've said my line (uses the microphone)</label>
+        {#if listen && !readMine}
+          <label class="tick"><input type="checkbox" bind:checked={keep} /> Record my lines so I can hear them back (kept on our server for a week)</label>
+        {/if}
       </section>
 
       {#if data.audio.total === 0}
@@ -324,6 +382,21 @@
     <div class="page done">
       <h1>That's the end.</h1>
       <p class="muted">Nicely done.</p>
+      {#if takes.length}
+        <section class="takes">
+          <h2>Hear yourself</h2>
+          {#each takes as t (t.attempt_id)}
+            <div class="card take">
+              <button class="btn small" aria-label="Play your recording" disabled={!t.has_audio} onclick={() => playTake(t.attempt_id)}>▶</button>
+              <span class="small">{t.expected}</span>
+              {#if t.hints}<span class="small muted">{t.hints} hint{t.hints === 1 ? '' : 's'}</span>{/if}
+            </div>
+          {/each}
+          <p class="small muted">Marking which lines were spot on is coming next.</p>
+        </section>
+      {:else if gettingTakes}
+        <p class="small muted">Getting your recordings…</p>
+      {/if}
       <button class="btn primary big" onclick={begin}>Go again</button>
       <button class="btn big" onclick={leave}>Change something</button>
       <a class="btn ghost" href="/script/{id}">Back to the script</a>
@@ -412,6 +485,9 @@
   .tick { display: flex; gap: 0.5rem; align-items: center; color: var(--text); margin-top: 0.75rem; }
   .big { width: 100%; min-height: 56px; font-size: 1.1rem; margin-top: 0.5rem; }
   .done { text-align: center; padding-top: 3rem; }
+  .takes { text-align: left; }
+  .take { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; }
+  .take span:nth-child(2) { flex: 1; }
 
   /* full-screen while rehearsing: nothing else on the page should scroll or distract */
   .stage { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; background: var(--bg); padding-top: env(safe-area-inset-top); }
