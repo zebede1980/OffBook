@@ -127,6 +127,36 @@ def cmd_dev_seed(args):
     print(f"demo script created (id {script_id})")
 
 
+def cmd_import_pages(args):
+    """Create a script from page photos already on this machine and queue them to be read, as the upload
+    screen would. The running server reads them (one PAID AI call per page)."""
+    import uuid
+
+    from offbook import jobs, scripts
+    from offbook.api.scripts import sniff
+    from offbook.db import now_utc
+    from offbook.parse import MAX_IMAGE_BYTES
+
+    s, conn = _open()
+    batch = []
+    for path in map(Path, args.images):
+        data = path.read_bytes()
+        kind = sniff(data)
+        if kind is None or len(data) > MAX_IMAGE_BYTES:
+            raise SystemExit(f"error: {path.name} must be a JPEG, PNG or WebP under {MAX_IMAGE_BYTES / 1e6:.1f} MB")
+        batch.append((data, *kind))
+    script_id = scripts.create_script(conn, args.title, None)
+    folder = s.data_dir / "pages" / str(script_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    for seq, (data, mime, ext) in enumerate(batch, 1):
+        name = f"{uuid.uuid4().hex}{ext}"
+        (folder / name).write_bytes(data)
+        conn.execute("INSERT INTO page(script_id, seq, image_path, mime, created_at) VALUES (?, ?, ?, ?, ?)",
+                     (script_id, seq, f"pages/{script_id}/{name}", mime, now_utc()))
+    jobs.enqueue(conn, "ocr", {"script_id": script_id})
+    print(f"script {script_id} created with {len(batch)} page(s) queued; the server will read them shortly")
+
+
 def cmd_serve(args):
     import uvicorn
 
@@ -151,6 +181,11 @@ def main(argv=None):
     sp.set_defaults(fn=cmd_set_password)
 
     sub.add_parser("check", help="report database, password, AI key and Kokoro status").set_defaults(fn=cmd_check)
+
+    sp = sub.add_parser("import-pages", help="create a script from page photos on disk (PAID: one AI call a page)")
+    sp.add_argument("--title", required=True)
+    sp.add_argument("images", nargs="+", help="page photos, in script order")
+    sp.set_defaults(fn=cmd_import_pages)
 
     sub.add_parser("dev-seed", help="add a small public-domain demo script").set_defaults(fn=cmd_dev_seed)
 
