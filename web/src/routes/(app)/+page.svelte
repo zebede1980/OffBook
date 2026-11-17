@@ -35,7 +35,13 @@
   function summary(s: ScriptSummary): string {
     if (s.reading) return `Reading ${s.reading} page${s.reading === 1 ? '' : 's'}…`;
     if (!s.speeches) return 'No lines yet';
-    return `${s.speeches} speeches · ${s.characters} characters`;
+    const base = `${s.speeches} speeches · ${s.characters} characters`;
+    if (s.voices_total && s.voices_ready < s.voices_total) {
+      const pct = Math.round((s.voices_ready / s.voices_total) * 100);
+      const mins = Math.max(1, Math.round(s.voices_eta / 60));
+      return `${base} · making voices ${pct}% (about ${mins} min)`;
+    }
+    return base;
   }
 </script>
 

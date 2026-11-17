@@ -3,6 +3,7 @@
   import { page } from '$app/state';
   import { api } from '#lib/api';
   import { ClipPlayer } from '#lib/rehearsal/clips';
+  import VoiceProgress from '#lib/components/VoiceProgress.svelte';
   import { countWords, newState, step, type Verdict } from '#lib/rehearsal/endpoint';
   import { Listener } from '#lib/rehearsal/listener';
   import { encodeWav } from '#lib/rehearsal/wav';
@@ -41,6 +42,7 @@
   let idx = $state(0);
   let status = $state<'loading' | 'speaking' | 'yourturn' | 'paused'>('loading');
   let hint = $state(0);
+  let slow = $state(false);
 
   // Each run() gets a number. Anything that restarts playback bumps it, and the old loop sees the change and stops.
   let gen = 0;
@@ -320,6 +322,16 @@
   });
 
   const myTurn = $derived(status === 'yourturn' && !!current?.mine);
+
+  // only mention waiting once it is noticeable; most clips arrive well inside this
+  $effect(() => {
+    if (phase !== 'running' || status !== 'loading') {
+      slow = false;
+      return;
+    }
+    const t = setTimeout(() => (slow = true), 700);
+    return () => clearTimeout(t);
+  });
 </script>
 
 {#if data}
@@ -367,11 +379,8 @@
 
       {#if data.audio.total === 0}
         <p class="warn small">Nobody has a voice yet. Give the characters voices on the Cast tab first.</p>
-      {:else if data.audio.ready < data.audio.total}
-        <p class="muted small">
-          {data.audio.ready} of {data.audio.total} lines have their voice ready. The rest are being made; you can start now.
-          <button class="btn small ghost" onclick={load}>Check again</button>
-        </p>
+      {:else}
+        <VoiceProgress scriptId={id} />
       {/if}
 
       <button class="btn primary big" onclick={start} disabled={data.audio.total === 0}>
@@ -405,6 +414,9 @@
     <div class="stage">
       <div class="topbar">
         <button class="btn small" onclick={leave}>Stop</button>
+        {#if current?.kind === 'dialogue'}
+          <a class="btn small" href="/script/{id}?line={current.line_id}&from=rehearse" aria-label="Fix a mistake in this line">Fix line</a>
+        {/if}
         <span class="spacer"></span>
         <div class="seg" role="radiogroup" aria-label="How to see the script">
           {#each views as v}
@@ -412,6 +424,8 @@
           {/each}
         </div>
       </div>
+
+      <div class="vpbar"><VoiceProgress scriptId={id} compact every={10000} /></div>
 
       {#if view === 'offbook'}
         <div class="blind" aria-live="polite">
@@ -447,6 +461,11 @@
         </ol>
       {/if}
 
+      {#if slow && current}
+        <p class="ear" aria-live="polite">
+          {current.clip_status === 'done' ? `Getting ${who(current)}'s line ready…` : `${who(current)}'s voice for this line is still being made. A few seconds…`}
+        </p>
+      {/if}
       {#if myTurn && hear !== 'off'}
         <p class="ear" class:live={hear === 'speaking'} aria-live="polite">
           {hear === 'waiting' ? 'Listening…' : hear === 'speaking' ? 'Hearing you' : hear === 'pausing' ? 'Moving on…' : hear === 'thinking' ? 'Take your time' : hear === 'nudge' ? "Stuck? Try Hint, or tap when you've said it." : ''}
@@ -492,6 +511,8 @@
   /* full-screen while rehearsing: nothing else on the page should scroll or distract */
   .stage { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; background: var(--bg); padding-top: env(safe-area-inset-top); }
   .topbar { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--line); }
+  .vpbar { padding: 0 0.75rem; }
+  .vpbar :global(.vp) { margin-top: 0.4rem; }
   .seg { display: flex; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
   .seg button { background: var(--surface); border: 0; padding: 0.45rem 0.7rem; font-size: 0.85rem; }
   .seg button.on { background: var(--accent); color: var(--accent-ink); font-weight: 600; }

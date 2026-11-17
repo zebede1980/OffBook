@@ -46,10 +46,14 @@ button { cursor: pointer; }
 .btn.small { min-height: 36px; padding: 0 0.7rem; font-size: 0.9rem; }
 .btn:disabled { opacity: 0.5; cursor: default; }
 .btn.ghost { background: transparent; border-color: transparent; }
-input[type='text'], input[type='password'], textarea, select {
+input[type='text'], input[type='password'], input[type='search'], textarea, select {
   width: 100%; min-height: 48px; padding: 0.55rem 0.75rem; border-radius: 12px; border: 1px solid var(--line); background: var(--surface);
 }
 label { display: block; font-size: 0.9rem; color: var(--muted); margin: 0.75rem 0 0.25rem; }
+/* a label styled as a button (wrapping a file input) looks and sits like any other button */
+label.btn { display: inline-flex; color: var(--text); margin: 0; cursor: pointer; }
+label.btn.small { font-size: 0.9rem; }
+label.btn:focus-within { outline: 2px solid var(--accent); }
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
 .muted { color: var(--muted); }
 .small { font-size: 0.85rem; }

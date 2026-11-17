@@ -20,6 +20,9 @@ export interface ScriptSummary {
   failed: number;
   speeches: number;
   characters: number;
+  voices_ready: number;
+  voices_total: number;
+  voices_eta: number;
 }
 
 export interface Page {
@@ -28,6 +31,7 @@ export interface Page {
   status: 'queued' | 'done' | 'failed';
   error: string | null;
   printed_number: number | null;
+  lines: number;
 }
 
 export interface Character {
@@ -56,8 +60,26 @@ export interface Line {
   page_id: number | null;
 }
 
+export type EngineId = 'kokoro' | 'zonos';
+
+export interface AudioProgress {
+  engine: EngineId;
+  total: number;
+  ready: number;
+  failed: number;
+  pending: number;
+  eta_seconds: number;
+  reading_pages: number;
+}
+
+export interface VoiceList {
+  engine: EngineId;
+  engines: { id: EngineId; label: string }[];
+  voices: Voice[];
+}
+
 export interface ScriptDetail {
-  script: { script_id: number; title: string; created_at: string };
+  script: { script_id: number; title: string; created_at: string; engine: EngineId };
   pages: Page[];
   characters: Character[];
   lines: Line[];
@@ -76,9 +98,9 @@ export interface RehearsalLine {
 }
 
 export interface Rehearsal {
-  script: { script_id: number; title: string };
+  script: { script_id: number; title: string; engine: EngineId };
   mine: number[];
   characters: { character_id: number; name: string; voice: string | null }[];
   lines: RehearsalLine[];
-  audio: { total: number; ready: number; failed: number };
+  audio: AudioProgress;
 }

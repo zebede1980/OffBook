@@ -1,14 +1,18 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, tick } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { api } from '#lib/api';
   import { shrinkImage } from '#lib/images';
+  import VoiceProgress from '#lib/components/VoiceProgress.svelte';
   import { castHue, segments } from '#lib/text';
   import { errorToast, toast } from '#lib/toast.svelte';
-  import type { Character, Kind, Line, ScriptDetail, Voice } from '#lib/types';
+  import type { AudioProgress, Character, EngineId, Kind, Line, ScriptDetail, Voice, VoiceList } from '#lib/types';
 
   const id = Number(page.params.id);
+  // arriving from a rehearsal's Fix button: open that line, and offer the way back
+  const fromRehearse = page.url.searchParams.get('from') === 'rehearse';
+  const focusLine = Number(page.url.searchParams.get('line')) || null;
   const kinds: { id: Kind; label: string }[] = [
     { id: 'dialogue', label: 'Speech' },
     { id: 'direction', label: 'Stage direction' },
@@ -36,6 +40,11 @@
   let deleting = $state(false);
   let password = $state('');
   let voices = $state<Voice[]>([]);
+  let engines = $state<VoiceList['engines']>([]);
+  let switching = $state(false);
+  let query = $state('');
+  let progress = $state<AudioProgress | null>(null);
+  let vp = $state<ReturnType<typeof VoiceProgress>>();
   let mine = $state<number[]>([]);
   let sample: HTMLAudioElement | null = null;
 
@@ -44,9 +53,17 @@
   );
   const needsLook = (l: Line) => l.unsure.length > 0 || (l.kind === 'dialogue' && l.speakers.length === 0);
   const toCheck = $derived((detail?.lines ?? []).filter(needsLook).length);
+  const q = $derived(query.trim().toLowerCase());
   const shown = $derived(
-    (detail?.lines ?? []).filter((l) => !onlyCheck || needsLook(l) || l.line_id === editing)
+    (detail?.lines ?? []).filter(
+      (l) =>
+        l.line_id === editing ||
+        ((!onlyCheck || needsLook(l)) &&
+          (!q || l.text.toLowerCase().includes(q) || l.speakers.some((c) => cast.get(c)?.name.toLowerCase().includes(q))))
+    )
   );
+  const failedPages = $derived((detail?.pages ?? []).filter((p) => p.status === 'failed'));
+  const unused = $derived((detail?.characters ?? []).filter((c) => c.lines === 0).length);
   const reading = $derived((detail?.pages ?? []).filter((p) => p.status === 'queued').length);
   const photoPage = $derived(detail?.pages.find((p) => p.page_id === photo) ?? null);
 
@@ -65,12 +82,52 @@
     }
   }
 
-  onMount(() => {
-    load();
-    // the cast tab's extras; the script is usable without them, so a failure here is not shown as an error
-    api.get<{ voices: Voice[] }>('/api/voices').then((r) => (voices = r.voices)).catch(() => {});
+  async function loadVoices(engine: EngineId) {
+    try {
+      const r = await api.get<VoiceList>(`/api/voices?engine=${engine}`);
+      voices = r.voices;
+      engines = r.engines;
+    } catch {
+      // the cast tab's extras; the script is usable without them, so a failure here is not shown as an error
+    }
+  }
+
+  onMount(async () => {
+    await load();
+    if (detail) loadVoices(detail.script.engine);
     api.get<{ character_ids: number[] }>(`/api/scripts/${id}/casting`).then((r) => (mine = r.character_ids)).catch(() => {});
+    const target = focusLine ? detail?.lines.find((l) => l.line_id === focusLine) : undefined;
+    if (target) {
+      tab = 'lines';
+      open(target);
+      await tick();
+      document.getElementById(`line-${target.line_id}`)?.scrollIntoView({ block: 'center' });
+    }
   });
+
+  async function setEngine(engine: EngineId) {
+    if (!detail || engine === detail.script.engine) return;
+    switching = true;
+    try {
+      progress = await api.put<AudioProgress>(`/api/scripts/${id}/engine`, { engine });
+      await load();
+      await loadVoices(engine);
+      vp?.refresh();
+      toast(`Now using ${engines.find((e) => e.id === engine)?.label ?? engine} voices. They're being made now.`);
+    } catch (err) {
+      errorToast(err);
+    } finally {
+      switching = false;
+    }
+  }
+
+  async function tidy() {
+    try {
+      apply(await api.post<ScriptDetail>(`/api/scripts/${id}/characters/tidy`));
+    } catch (err) {
+      errorToast(err);
+    }
+  }
   onDestroy(() => {
     clearTimeout(timer);
     sample?.pause();
@@ -84,6 +141,7 @@
     try {
       await api.patch(`/api/characters/${c.character_id}/voice`, { voice: voice || null, speed: c.speed });
       await load();
+      vp?.refresh();
     } catch (err) {
       errorToast(err);
     }
@@ -92,7 +150,7 @@
   function playSample(voice: string | null) {
     if (!voice) return;
     sample?.pause();
-    sample = new Audio(`/api/voices/${voice}/preview`);
+    sample = new Audio(`/api/voices/${voice}/preview?engine=${detail?.script.engine}`);
     sample.play().catch(() => toast("Couldn't play that voice just now."));
   }
 
@@ -150,6 +208,7 @@
       await fn();
       editing = null;
       await load();
+      vp?.refresh();
       const next = reopen?.();
       if (next) open(next);
     } catch (e) {
@@ -231,12 +290,41 @@
     armed = false;
   }
 
-  async function retryPage() {
+  async function retryPage(pageId = photo) {
     try {
-      apply(await api.post<ScriptDetail>(`/api/pages/${photo}/retry`));
+      apply(await api.post<ScriptDetail>(`/api/pages/${pageId}/retry`));
       photo = null;
     } catch (err) {
       errorToast(err);
+    }
+  }
+
+  async function movePage(to: number) {
+    try {
+      apply(await api.post<ScriptDetail>(`/api/pages/${photo}/move`, { to }));
+      armed = false;
+    } catch (err) {
+      errorToast(err);
+    }
+  }
+
+  async function replacePage(e: Event, pageId: number) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    try {
+      uploading = 'Getting the new photo ready…';
+      const form = new FormData();
+      form.append('file', await shrinkImage(file), 'page.jpg');
+      uploading = 'Sending…';
+      apply(await api.upload<ScriptDetail>(`/api/pages/${pageId}/replace`, form));
+      photo = null;
+      toast('New photo added. Reading it now.');
+    } catch (err) {
+      errorToast(err);
+    } finally {
+      uploading = '';
     }
   }
 
@@ -277,7 +365,11 @@
 
 {#if detail}
   <div class="page">
-    <a class="small" href="/">‹ All scripts</a>
+    {#if fromRehearse}
+      <a class="btn primary back" href="/script/{id}/rehearse">‹ Back to rehearsing</a>
+    {:else}
+      <a class="small" href="/">‹ All scripts</a>
+    {/if}
 
     {#if renaming}
       <form class="row rename" onsubmit={rename}>
@@ -292,12 +384,14 @@
       </div>
     {/if}
 
-    {#if detail.lines.length}<a class="btn primary go" href="/script/{id}/rehearse">Rehearse</a>{/if}
+    {#if detail.lines.length && !fromRehearse}<a class="btn primary go" href="/script/{id}/rehearse">Rehearse</a>{/if}
+    <VoiceProgress scriptId={id} bind:progress bind:this={vp} />
 
     <div class="strip">
       {#each detail.pages as p (p.page_id)}
         <button class="thumb" onclick={() => showPhoto(p.page_id)} aria-label="Page {p.seq}{p.status === 'failed' ? ', has a problem' : ''}">
           <img src="/api/pages/{p.page_id}/image" alt="" loading="lazy" />
+          <span class="num">{p.seq}</span>
           {#if p.status === 'queued'}<span class="tag">Reading…</span>{/if}
           {#if p.status === 'failed'}<span class="tag bad">Problem</span>{/if}
         </button>
@@ -312,7 +406,22 @@
       </label>
     </div>
     {#if uploading}<p class="muted small">{uploading}</p>{/if}
-    {#if reading}<p class="muted small">Reading {reading} page{reading === 1 ? '' : 's'}. Each takes a few seconds.</p>{/if}
+    {#if reading}<p class="muted small">Reading {reading} page{reading === 1 ? '' : 's'}. Each takes about half a minute.</p>{/if}
+    {#if detail.pages.length > 1}<p class="muted small hint">Tap a page to move it, replace its photo or delete it.</p>{/if}
+
+    {#each failedPages as fp (fp.page_id)}
+      <div class="card problem">
+        <p><strong>Page {fp.seq} couldn't be read.</strong> {fp.error}</p>
+        <div class="row">
+          <button class="btn small" onclick={() => retryPage(fp.page_id)}>Try again</button>
+          <label class="btn small">
+            <input class="sr-only" type="file" accept="image/*" onchange={(e) => replacePage(e, fp.page_id)} disabled={!!uploading} />
+            Replace photo
+          </label>
+          <button class="btn small ghost" onclick={() => showPhoto(fp.page_id)}>See it</button>
+        </div>
+      </div>
+    {/each}
 
     <div class="tabs" role="tablist">
       <button role="tab" aria-selected={tab === 'lines'} class:on={tab === 'lines'} onclick={() => (tab = 'lines')}>Lines</button>
@@ -322,6 +431,9 @@
     </div>
 
     {#if tab === 'lines'}
+      {#if detail.lines.length > 8}
+        <input class="search" type="search" placeholder="Find a line or a character" aria-label="Find a line" bind:value={query} />
+      {/if}
       {#if toCheck}
         <label class="check">
           <input type="checkbox" bind:checked={onlyCheck} />
@@ -339,7 +451,7 @@
 
       <ol class="lines">
         {#each shown as l (l.line_id)}
-          <li>
+          <li id="line-{l.line_id}">
             {#if editing === l.line_id}
               <div class="card editor">
                 <div class="seg" role="radiogroup" aria-label="What kind of line is this?">
@@ -395,7 +507,20 @@
           </li>
         {/each}
       </ol>
+      {#if q && !shown.length}<p class="muted small empty">No lines match "{query}".</p>{/if}
     {:else}
+      {#if engines.length > 1}
+        <div class="card engine">
+          <label for="eng">Voices made by</label>
+          <select id="eng" value={detail.script.engine} disabled={switching} onchange={(e) => setEngine(e.currentTarget.value as EngineId)}>
+            {#each engines as e}<option value={e.id}>{e.label}</option>{/each}
+          </select>
+          <p class="small muted">Switching keeps the voices you picked, so you can switch back without losing them.</p>
+        </div>
+      {/if}
+      {#if unused}
+        <button class="btn small tidy" onclick={tidy}>Remove {unused} character{unused === 1 ? '' : 's'} with no lines</button>
+      {/if}
       {#each detail.characters as c, i (c.character_id)}
         <div class="card castrow" class:me={mine.includes(c.character_id)}>
           <div class="row">
@@ -463,12 +588,24 @@
   {#if photoPage}
     <div class="overlay" role="dialog" aria-modal="true" aria-label="Photo of page {photoPage.seq}">
       <div class="bar">
-        <strong>Page {photoPage.seq}</strong>
+        <strong>Page {photoPage.seq} of {detail.pages.length}</strong>
+        <span class="small muted">{photoPage.status === 'queued' ? 'reading…' : `${photoPage.lines} line${photoPage.lines === 1 ? '' : 's'}`}</span>
         <span class="spacer"></span>
-        {#if photoPage.status === 'failed'}<button class="btn small" onclick={retryPage}>Try reading again</button>{/if}
-        <button class="btn small danger" onclick={deletePage}>{armed ? 'Yes, delete page and its lines' : 'Delete page'}</button>
         <button class="btn small" onclick={() => (photo = null)}>Close</button>
       </div>
+      <div class="bar tools">
+        <button class="btn small" disabled={photoPage.seq === 1} onclick={() => movePage(photoPage.seq - 1)} aria-label="Move this page earlier">‹ Earlier</button>
+        <button class="btn small" disabled={photoPage.seq === detail.pages.length} onclick={() => movePage(photoPage.seq + 1)} aria-label="Move this page later">Later ›</button>
+        <label class="btn small" class:off={!!uploading}>
+          <input class="sr-only" type="file" accept="image/*" onchange={(e) => replacePage(e, photoPage.page_id)} disabled={!!uploading} />
+          Replace photo
+        </label>
+        {#if photoPage.status === 'failed'}<button class="btn small" onclick={() => retryPage()}>Try reading again</button>{/if}
+        <button class="btn small danger" onclick={deletePage}>
+          {armed ? `Yes, delete it and its ${photoPage.lines} line${photoPage.lines === 1 ? '' : 's'}` : 'Delete page'}
+        </button>
+      </div>
+      {#if uploading}<p class="muted small pad">{uploading}</p>{/if}
       {#if photoPage.error}<p class="err">{photoPage.error}</p>{/if}
       <div class="scroll"><img src="/api/pages/{photoPage.page_id}/image" alt="Photo of page {photoPage.seq}" /></div>
     </div>
@@ -486,6 +623,20 @@
   .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .tag { position: absolute; left: 0; right: 0; bottom: 0; font-size: 0.65rem; padding: 2px; background: rgb(0 0 0 / 0.7); color: #fff; }
   .tag.bad { background: var(--danger); }
+  .num { position: absolute; top: 3px; left: 3px; min-width: 20px; padding: 0 4px; border-radius: 6px; font-size: 0.7rem; font-weight: 700; background: rgb(0 0 0 / 0.65); color: #fff; }
+  .hint { margin: 0; }
+  .problem { padding: 0.75rem; margin: 0.5rem 0; border-color: var(--danger); }
+  .problem p { margin: 0 0 0.5rem; }
+  .problem .row { flex-wrap: wrap; }
+  .search { margin-bottom: 0.6rem; }
+  /* stays in view while fixing a line, so the way back to the rehearsal is always one tap */
+  .back { width: 100%; position: sticky; top: calc(64px + env(safe-area-inset-top)); z-index: 30; box-shadow: var(--shadow); }
+  .engine { padding: 0.25rem 0.9rem 0.75rem; margin-bottom: 0.75rem; }
+  .engine p { margin: 0.4rem 0 0; }
+  .tidy { margin-bottom: 0.75rem; }
+  .tools { border-top: 0; }
+  .tools .off { opacity: 0.5; }
+  .pad { margin: 0; padding: 0.4rem 0.75rem; }
   .addp { display: grid; place-items: center; text-align: center; font-size: 0.78rem; color: var(--muted); border-style: dashed; cursor: pointer; margin: 0; padding: 0.25rem; }
   .addp.off { opacity: 0.5; }
   .addp:focus-within { outline: 2px solid var(--accent); }
