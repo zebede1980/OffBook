@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from offbook import auth, db, jobs, parse, scripts
+from offbook import audio, auth, db, jobs, parse, scripts, tts
 from offbook.api.deps import current_profile, get_conn
 from offbook.db import now_utc
 
@@ -59,6 +59,10 @@ class MergeIn(BaseModel):
     into: int
 
 
+class MoveIn(BaseModel):
+    to: int = Field(ge=1)
+
+
 def sniff(data: bytes) -> tuple[str, str] | None:
     """Image type from the file's first bytes; the browser's stated type is not trusted."""
     if data[:3] == b"\xff\xd8\xff":
@@ -68,6 +72,16 @@ def sniff(data: bytes) -> tuple[str, str] | None:
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp", ".webp"
     return None
+
+
+def _read_photo(f: UploadFile, n: int) -> tuple[bytes, str, str]:
+    data = f.file.read(parse.MAX_IMAGE_BYTES + 1)
+    if len(data) > parse.MAX_IMAGE_BYTES:
+        raise HTTPException(413, f"Photo {n} is too big.")
+    kind = sniff(data)
+    if kind is None:
+        raise HTTPException(415, f"Photo {n} isn't a JPEG, PNG or WebP image.")
+    return data, *kind
 
 
 def _script(conn: sqlite3.Connection, script_id: int) -> sqlite3.Row:
@@ -140,10 +154,12 @@ def script_detail(conn: sqlite3.Connection, script_id: int) -> dict:
                WHERE l.script_id = ? ORDER BY ls.character_id""", (script_id,)):
         by_line.setdefault(line_id, []).append(character_id)
     return {
-        "script": {"script_id": s["script_id"], "title": s["title"], "created_at": s["created_at"]},
+        "script": {"script_id": s["script_id"], "title": s["title"], "created_at": s["created_at"],
+                   "engine": s["engine"]},
         "pages": [{"page_id": p["page_id"], "seq": p["seq"], "status": p["status"], "error": p["error"],
-                   "printed_number": p["printed_number"]}
-                  for p in conn.execute("SELECT * FROM page WHERE script_id = ? ORDER BY seq", (script_id,))],
+                   "printed_number": p["printed_number"], "lines": p["n"]}
+                  for p in conn.execute("""SELECT p.*, (SELECT COUNT(*) FROM line l WHERE l.page_id = p.page_id) AS n
+                                           FROM page p WHERE p.script_id = ? ORDER BY p.seq""", (script_id,))],
         "characters": [{"character_id": c["character_id"], "name": c["name"], "lines": c["n"], "voice": c["voice"],
                         "speed": c["speed"]} for c in conn.execute(
             """SELECT c.*, (SELECT COUNT(*) FROM line_speaker ls WHERE ls.character_id = c.character_id) AS n
@@ -156,7 +172,7 @@ def script_detail(conn: sqlite3.Connection, script_id: int) -> dict:
 # --- scripts
 
 @router.get("/scripts")
-def list_scripts(conn=Depends(get_conn)):
+def list_scripts(request: Request, conn=Depends(get_conn)):
     rows = conn.execute(
         """SELECT s.script_id, s.title, s.created_at,
                   (SELECT COUNT(*) FROM page p WHERE p.script_id = s.script_id) AS pages,
@@ -165,12 +181,19 @@ def list_scripts(conn=Depends(get_conn)):
                   (SELECT COUNT(*) FROM line l WHERE l.script_id = s.script_id AND l.kind = 'dialogue') AS speeches,
                   (SELECT COUNT(*) FROM character c WHERE c.script_id = s.script_id) AS characters
            FROM script s ORDER BY s.script_id DESC""").fetchall()
-    return {"scripts": [dict(r) for r in rows]}
+    s = request.app.state.settings
+    out = []
+    for r in rows:
+        p = audio.progress(conn, s, r["script_id"])
+        out.append({**dict(r), "voices_ready": p["ready"], "voices_total": p["total"], "voices_eta": p["eta_seconds"]})
+    return {"scripts": out}
 
 
 @router.post("/scripts")
-def create_script(body: ScriptIn, profile=Depends(current_profile), conn=Depends(get_conn)):
-    script_id = scripts.create_script(conn, _text(body.title), profile["profile_id"])
+def create_script(body: ScriptIn, request: Request, profile=Depends(current_profile), conn=Depends(get_conn)):
+    s = request.app.state.settings
+    engine = s.default_engine if s.default_engine in tts.available(s) else "kokoro"
+    script_id = scripts.create_script(conn, _text(body.title), profile["profile_id"], engine)
     return script_detail(conn, script_id)
 
 
@@ -212,15 +235,7 @@ def upload_pages(script_id: int, files: list[UploadFile], request: Request, prof
     have = conn.execute("SELECT COUNT(*) FROM page WHERE script_id = ?", (script_id,)).fetchone()[0]
     if have + len(files) > MAX_PAGES_PER_SCRIPT:
         raise HTTPException(400, f"A script can have at most {MAX_PAGES_PER_SCRIPT} pages.")
-    batch = []
-    for n, f in enumerate(files, 1):
-        data = f.file.read(parse.MAX_IMAGE_BYTES + 1)
-        if len(data) > parse.MAX_IMAGE_BYTES:
-            raise HTTPException(413, f"Photo {n} is too big.")
-        kind = sniff(data)
-        if kind is None:
-            raise HTTPException(415, f"Photo {n} isn't a JPEG, PNG or WebP image.")
-        batch.append((data, *kind))
+    batch = [_read_photo(f, n) for n, f in enumerate(files, 1)]
     folder = s.data_dir / "pages" / str(script_id)
     folder.mkdir(parents=True, exist_ok=True)
     seq = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM page WHERE script_id = ?", (script_id,)).fetchone()[0]
@@ -249,6 +264,23 @@ def retry_page(page_id: int, profile=Depends(current_profile), conn=Depends(get_
     if page["status"] != "failed":
         raise HTTPException(400, "Only a page that failed can be read again.")
     conn.execute("UPDATE page SET status = 'queued', error = NULL WHERE page_id = ?", (page_id,))
+    jobs.enqueue(conn, "ocr", {"script_id": page["script_id"]}, profile["profile_id"])
+    return script_detail(conn, page["script_id"])
+
+
+@router.post("/pages/{page_id}/move")
+def move_page(page_id: int, body: MoveIn, conn=Depends(get_conn)):
+    page = _page(conn, page_id)
+    scripts.move_page(conn, page, body.to)
+    return script_detail(conn, page["script_id"])
+
+
+@router.post("/pages/{page_id}/replace")
+def replace_page(page_id: int, file: UploadFile, request: Request, profile=Depends(current_profile),
+                 conn=Depends(get_conn)):
+    page = _page(conn, page_id)
+    data, mime, ext = _read_photo(file, 1)
+    scripts.replace_page(conn, request.app.state.settings, page, data, mime, ext)
     jobs.enqueue(conn, "ocr", {"script_id": page["script_id"]}, profile["profile_id"])
     return script_detail(conn, page["script_id"])
 
@@ -382,3 +414,11 @@ def delete_character(character_id: int, conn=Depends(get_conn)):
         raise HTTPException(400, f"{c['name']} still has {used} line(s). Merge them into another character first.")
     conn.execute("DELETE FROM character WHERE character_id = ?", (character_id,))
     return {"ok": True}
+
+
+@router.post("/scripts/{script_id}/characters/tidy")
+def tidy_characters(script_id: int, conn=Depends(get_conn)):
+    """Remove every character that has no lines left."""
+    _script(conn, script_id)
+    scripts.drop_unused_characters(conn, script_id)
+    return script_detail(conn, script_id)

@@ -4,11 +4,15 @@ The model both reads the text and works out who says what. Everything it returns
 `validate_page` before anything else sees it.
 """
 
+import io
+import logging
 import re
 import sqlite3
 
 from offbook import llm
 from offbook.config import Settings
+
+log = logging.getLogger(__name__)
 
 KINDS = ("dialogue", "direction", "heading")
 MAX_ITEMS = 400
@@ -106,15 +110,29 @@ def validate_page(obj: dict) -> list[str]:
     return errors
 
 
+_PART_NOTE = {
+    ("first", "columns"): "This image is only the LEFT half of the page; the right half is read separately.",
+    ("second", "columns"): "This image is only the RIGHT half of the page; the left half was read separately. If it "
+                           "opens mid-speech with no name above, that speech began in the left half: set "
+                           '"continues".',
+    ("first", "rows"): "This image is only the TOP half of the page; the bottom half is read separately.",
+    ("second", "rows"): "This image is only the BOTTOM half of the page; the top half was read separately. If it "
+                        'opens mid-speech with no name above, that speech began in the top half: set "continues".',
+}
+
+
 def parse_page(conn: sqlite3.Connection, s: Settings, image: bytes, mime: str, known: list[str],
-               profile_id: int | None = None, model: str | None = None) -> dict:
+               profile_id: int | None = None, model: str | None = None,
+               part: tuple[str, str] | None = None) -> dict:
     """One AI call (two if the first reply fails validation). `known` is the cast seen on earlier pages, so that
-    names come back spelt the same way throughout a script."""
+    names come back spelt the same way throughout a script. `part` says which half of a split page this is."""
     if len(image) > MAX_IMAGE_BYTES:
         raise ValueError(f"image is {len(image) / 1e6:.1f} MB; shrink it below {MAX_IMAGE_BYTES / 1e6:.1f} MB first")
     cast = ("Characters seen so far in this script: " + ", ".join(known)
             + ". Use these exact spellings wherever the page means the same character."
             if known else "This is the first page; no characters are known yet.")
+    if part is not None:
+        cast += " " + _PART_NOTE[part]
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": [{"type": "text", "text": cast}, llm.image_part(image, mime)]}]
     return llm.call_json(conn, s, purpose="parse_page", model=model or s.parse_model, messages=messages,
@@ -123,3 +141,58 @@ def parse_page(conn: sqlite3.Connection, s: Settings, image: bytes, mime: str, k
 
 def speakers_in(page: dict) -> list[str]:
     return list(dict.fromkeys(sp for it in page["items"] if it["kind"] == "dialogue" for sp in it["speakers"]))
+
+
+def split_image(data: bytes) -> tuple[bytes, bytes, str]:
+    """Cut a page photo in two along its emptiest line near the middle: between the columns of a landscape
+    two-column page, otherwise between two rows of text. Returns (first, second, "columns" | "rows")."""
+    from PIL import Image, ImageOps
+
+    im = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+    w, h = im.size
+    grey = im.convert("L")
+    columns = w > h * 1.15
+    size = w if columns else h
+    # a box resize to one pixel high (or wide) averages each column (or row): brighter = emptier
+    strip = grey.resize((size, 1) if columns else (1, size), Image.Resampling.BOX)
+    flat = getattr(strip, "get_flattened_data", None) or strip.getdata   # renamed in Pillow 13
+    profile = list(flat())
+    lo, hi = int(size * 0.35), int(size * 0.65)
+    win = max(1, size // 100)
+    smoothed = [sum(profile[max(0, i - win):i + win + 1]) / len(profile[max(0, i - win):i + win + 1])
+                for i in range(lo, hi)]
+    cut = lo + max(range(len(smoothed)), key=lambda i: (smoothed[i], -abs(lo + i - size // 2)))
+    boxes = ((0, 0, cut, h), (cut, 0, w, h)) if columns else ((0, 0, w, cut), (0, cut, w, h))
+    out = []
+    for box in boxes:
+        buf = io.BytesIO()
+        im.crop(box).save(buf, "JPEG", quality=90)
+        out.append(buf.getvalue())
+    return out[0], out[1], "columns" if columns else "rows"
+
+
+def merge_parts(first: dict, second: dict) -> dict:
+    """Put a split page back together. A speech that runs across the cut is joined."""
+    a, b = list(first["items"]), list(second["items"])
+    if a and b and a[-1]["kind"] == "dialogue" and b[0]["kind"] == "dialogue" and b[0]["continues"]:
+        head, tail = a[-1], b.pop(0)
+        a[-1] = {**head, "text": f"{head['text']} {tail['text']}", "spoken": f"{head['spoken']} {tail['spoken']}",
+                 "highlighted": head["highlighted"] or tail["highlighted"], "unsure": head["unsure"] + tail["unsure"]}
+    return {"page_number": first["page_number"] or second["page_number"], "items": a + b, "split": True}
+
+
+def read_page(conn: sqlite3.Connection, s: Settings, image: bytes, mime: str, known: list[str],
+              profile_id: int | None = None) -> dict:
+    """parse_page, made robust against a reply that runs out of room. That happens two ways: now and then the
+    model gets stuck and fills its whole allowance (one more try usually works), and a very dense page can
+    genuinely need more than one reply holds. So: try, try again, then read the page in two halves."""
+    for attempt in (1, 2):
+        try:
+            return parse_page(conn, s, image, mime, known, profile_id)
+        except llm.Truncated as e:
+            log.warning("page reply ran out of room (try %d): %s", attempt, e)
+    first, second, how = split_image(image)
+    a = parse_page(conn, s, first, "image/jpeg", known, profile_id, part=("first", how))
+    b = parse_page(conn, s, second, "image/jpeg", list(dict.fromkeys(known + speakers_in(a))), profile_id,
+                   part=("second", how))
+    return merge_parts(a, b)

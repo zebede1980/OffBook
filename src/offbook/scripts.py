@@ -102,7 +102,8 @@ def _friendly(e: Exception) -> str:
     if isinstance(e, llm.CapReached):
         return "Today's page-reading limit has been reached. Try again tomorrow."
     if isinstance(e, llm.Truncated):
-        return "There was too much on this page to read in one go. Try photographing it in two halves."
+        return ("There was too much on this page to read, even in two halves. Try Replace photo with a "
+                "closer photo of half the page, then add the other half as a new page.")
     if isinstance(e, FileNotFoundError):
         return "The photo for this page has gone missing. Delete it and add it again."
     return "Couldn't read this page. Try again, or retake the photo."
@@ -123,7 +124,7 @@ def ocr_job(conn: sqlite3.Connection, s: Settings, payload: dict, profile_id: in
             image = (s.data_dir / page["image_path"]).read_bytes()
             known = [r[0] for r in conn.execute("SELECT name FROM character WHERE script_id = ? ORDER BY character_id",
                                                 (script_id,))]
-            result = parse.parse_page(conn, s, image, page["mime"], known, profile_id)
+            result = parse.read_page(conn, s, image, page["mime"], known, profile_id)
             with db.tx(conn):
                 add_page_items(conn, script_id, page["page_id"], result)
                 conn.execute("UPDATE page SET status = 'done', error = NULL, printed_number = ?, raw_json = ? "
@@ -152,9 +153,9 @@ def voice_and_queue(conn: sqlite3.Connection, s: Settings, script_id: int) -> No
         log.warning("voices unavailable for script %s: %s", script_id, e)
 
 
-def create_script(conn: sqlite3.Connection, title: str, profile_id: int | None) -> int:
-    return conn.execute("INSERT INTO script(title, created_by, created_at) VALUES (?, ?, ?)",
-                        (title, profile_id, now_utc())).lastrowid
+def create_script(conn: sqlite3.Connection, title: str, profile_id: int | None, engine: str = "kokoro") -> int:
+    return conn.execute("INSERT INTO script(title, created_by, created_at, engine) VALUES (?, ?, ?, ?)",
+                        (title, profile_id, now_utc(), engine)).lastrowid
 
 
 def delete_script(conn: sqlite3.Connection, s: Settings, script_id: int) -> None:
@@ -163,10 +164,60 @@ def delete_script(conn: sqlite3.Connection, s: Settings, script_id: int) -> None
     shutil.rmtree(s.data_dir / "pages" / str(script_id), ignore_errors=True)
 
 
+def drop_unused_characters(conn: sqlite3.Connection, script_id: int) -> int:
+    """Remove characters who no longer have a single line (after their pages were deleted, say)."""
+    return conn.execute("""DELETE FROM character WHERE script_id = ? AND NOT EXISTS
+                           (SELECT 1 FROM line_speaker ls WHERE ls.character_id = character.character_id)""",
+                        (script_id,)).rowcount
+
+
 def delete_page(conn: sqlite3.Connection, s: Settings, page: sqlite3.Row) -> None:
     with db.tx(conn):
         conn.execute("DELETE FROM line WHERE page_id = ?", (page["page_id"],))
         conn.execute("DELETE FROM page WHERE page_id = ?", (page["page_id"],))
+        conn.execute("UPDATE page SET seq = seq - 1 WHERE script_id = ? AND seq > ?", (page["script_id"], page["seq"]))
+        renumber(conn, page["script_id"])
+        drop_unused_characters(conn, page["script_id"])
+    (s.data_dir / page["image_path"]).unlink(missing_ok=True)
+
+
+def order_lines_by_pages(conn: sqlite3.Connection, script_id: int) -> None:
+    """After pages have been reordered, put the lines in the new page order. Within a page the order is kept.
+    A line typed in by hand belongs to the page of the line before it."""
+    page_seq = dict(conn.execute("SELECT page_id, seq FROM page WHERE script_id = ?", (script_id,)).fetchall())
+    rows = conn.execute("SELECT line_id, page_id FROM line WHERE script_id = ? ORDER BY seq", (script_id,)).fetchall()
+    keyed, current = [], -1
+    for i, r in enumerate(rows):
+        if r["page_id"] in page_seq:
+            current = page_seq[r["page_id"]]
+        keyed.append((current, i, r["line_id"]))
+    keyed.sort()
+    conn.executemany("UPDATE line SET seq = ? WHERE line_id = ?", [(n + 1, k[2]) for n, k in enumerate(keyed)])
+
+
+def move_page(conn: sqlite3.Connection, page: sqlite3.Row, to: int) -> None:
+    """Move a page to position `to` (1 = first), shifting the others, and reorder the lines to match."""
+    script_id = page["script_id"]
+    ids = [r[0] for r in conn.execute("SELECT page_id FROM page WHERE script_id = ? ORDER BY seq", (script_id,))]
+    ids.remove(page["page_id"])
+    ids.insert(max(0, min(len(ids), to - 1)), page["page_id"])
+    with db.tx(conn):
+        conn.executemany("UPDATE page SET seq = ? WHERE page_id = ?", [(-(n + 1), pid) for n, pid in enumerate(ids)])
+        conn.execute("UPDATE page SET seq = -seq WHERE script_id = ?", (script_id,))
+        order_lines_by_pages(conn, script_id)
+
+
+def replace_page(conn: sqlite3.Connection, s: Settings, page: sqlite3.Row, data: bytes, mime: str, ext: str) -> None:
+    """Swap in a new photo of the same page. Its old lines go, and it is read again in the same place."""
+    import uuid
+
+    rel = f"pages/{page['script_id']}/{uuid.uuid4().hex}{ext}"
+    (s.data_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+    (s.data_dir / rel).write_bytes(data)
+    with db.tx(conn):
+        conn.execute("DELETE FROM line WHERE page_id = ?", (page["page_id"],))
+        conn.execute("""UPDATE page SET image_path = ?, mime = ?, status = 'queued', error = NULL,
+                        printed_number = NULL, raw_json = NULL WHERE page_id = ?""", (rel, mime, page["page_id"]))
         renumber(conn, page["script_id"])
     (s.data_dir / page["image_path"]).unlink(missing_ok=True)
 
