@@ -46,7 +46,7 @@ def test_two_pages_become_one_running_script(kid, script, conn, settings, fake_l
         page_json(speech([], "upstairs all morning.", continues=True), speech("Jack", "A likely story."), number=2),
     ]
     assert upload(kid, script, JPEG, JPEG).status_code == 200
-    assert read_pages(conn, settings) == 1
+    assert read_pages(conn, settings) >= 1   # the reading job, plus the audio jobs it queues
 
     d = kid.get(f"/api/scripts/{script}").json()
     assert [p["status"] for p in d["pages"]] == ["done", "done"]

@@ -7,7 +7,7 @@ from fastapi.responses import FileResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from offbook import config, db, jobs
-from offbook.api import auth as auth_api, scripts as scripts_api
+from offbook.api import audio as audio_api, auth as auth_api, scripts as scripts_api
 from offbook.api.deps import get_conn, require_xhr
 from offbook.auth import Throttle
 
@@ -37,6 +37,7 @@ def create_app(settings: config.Settings | None = None) -> FastAPI:
 
     app.include_router(auth_api.router)
     app.include_router(scripts_api.router)
+    app.include_router(audio_api.router)
 
     @app.get("/api/health")
     def health(conn=Depends(get_conn)):

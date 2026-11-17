@@ -134,7 +134,7 @@ class Worker:
 
 def _load_handlers() -> None:
     # Importing registers the handlers via @handler.
-    from offbook import scripts  # noqa: F401
+    from offbook import audio, scripts  # noqa: F401
 
 
 def job_out(r: sqlite3.Row) -> dict:

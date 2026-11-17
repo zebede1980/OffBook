@@ -9,7 +9,7 @@ import logging
 import shutil
 import sqlite3
 
-from offbook import db, jobs, llm, parse
+from offbook import audio, db, jobs, llm, parse, tts
 from offbook.config import Settings
 from offbook.db import now_utc
 
@@ -129,6 +129,7 @@ def ocr_job(conn: sqlite3.Connection, s: Settings, payload: dict, profile_id: in
                 conn.execute("UPDATE page SET status = 'done', error = NULL, printed_number = ?, raw_json = ? "
                              "WHERE page_id = ?", (result["page_number"], json.dumps(result), page["page_id"]))
             done += 1
+            voice_and_queue(conn, s, script_id)
         except Exception as e:
             log.warning("page %s of script %s failed: %s: %s", page["page_id"], script_id, type(e).__name__, e)
             if isinstance(e, llm.CapReached):
@@ -139,6 +140,16 @@ def ocr_job(conn: sqlite3.Connection, s: Settings, payload: dict, profile_id: in
                          (_friendly(e), page["page_id"]))
             failed += 1
     return {"done": done, "failed": failed}
+
+
+def voice_and_queue(conn: sqlite3.Connection, s: Settings, script_id: int) -> None:
+    """Give any new characters a voice and queue the audio for new lines. The TTS server being down must not
+    stop pages being read, so that is logged and left for the next sync."""
+    try:
+        audio.auto_assign(conn, s, script_id)
+        audio.sync_clips(conn, s, script_id)
+    except tts.TTSError as e:
+        log.warning("voices unavailable for script %s: %s", script_id, e)
 
 
 def create_script(conn: sqlite3.Connection, title: str, profile_id: int | None) -> int:

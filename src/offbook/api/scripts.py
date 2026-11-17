@@ -115,6 +115,11 @@ def _text(value: str) -> str:
     return value
 
 
+def _resync(request: Request, conn: sqlite3.Connection, script_id: int) -> None:
+    """Lines or speakers changed, so the audio needed may have too."""
+    scripts.voice_and_queue(conn, request.app.state.settings, script_id)
+
+
 def line_out(r: sqlite3.Row, speakers: list[int]) -> dict:
     return {"line_id": r["line_id"], "seq": r["seq"], "kind": r["kind"], "text": r["text"], "spoken": r["spoken"],
             "speakers": speakers, "highlighted": bool(r["highlighted"]), "unsure": json.loads(r["unsure"]),
@@ -139,7 +144,8 @@ def script_detail(conn: sqlite3.Connection, script_id: int) -> dict:
         "pages": [{"page_id": p["page_id"], "seq": p["seq"], "status": p["status"], "error": p["error"],
                    "printed_number": p["printed_number"]}
                   for p in conn.execute("SELECT * FROM page WHERE script_id = ? ORDER BY seq", (script_id,))],
-        "characters": [{"character_id": c["character_id"], "name": c["name"], "lines": c["n"]} for c in conn.execute(
+        "characters": [{"character_id": c["character_id"], "name": c["name"], "lines": c["n"], "voice": c["voice"],
+                        "speed": c["speed"]} for c in conn.execute(
             """SELECT c.*, (SELECT COUNT(*) FROM line_speaker ls WHERE ls.character_id = c.character_id) AS n
                FROM character c WHERE c.script_id = ? ORDER BY c.character_id""", (script_id,))],
         "lines": [line_out(r, by_line.get(r["line_id"], []))
@@ -257,7 +263,7 @@ def delete_page(page_id: int, request: Request, conn=Depends(get_conn)):
 # --- lines
 
 @router.post("/scripts/{script_id}/lines")
-def add_line(script_id: int, body: LineIn, conn=Depends(get_conn)):
+def add_line(script_id: int, body: LineIn, request: Request, conn=Depends(get_conn)):
     _script(conn, script_id)
     after_seq, page_id = 0, None
     if body.after_line_id is not None:
@@ -269,11 +275,12 @@ def add_line(script_id: int, body: LineIn, conn=Depends(get_conn)):
     with db.tx(conn):
         line_id = scripts.insert_line(conn, script_id, after_seq, body.kind, _text(body.text), page_id=page_id,
                                       speakers=speakers)
+    _resync(request, conn, script_id)
     return _one_line(conn, line_id)
 
 
 @router.patch("/lines/{line_id}")
-def edit_line(line_id: int, body: LinePatch, conn=Depends(get_conn)):
+def edit_line(line_id: int, body: LinePatch, request: Request, conn=Depends(get_conn)):
     line = _line(conn, line_id)
     kind = body.kind or line["kind"]
     text = _text(body.text) if body.text is not None else line["text"]
@@ -294,6 +301,7 @@ def edit_line(line_id: int, body: LinePatch, conn=Depends(get_conn)):
             scripts.set_speakers(conn, line_id, [])
         elif speakers is not None:
             scripts.set_speakers(conn, line_id, speakers)
+    _resync(request, conn, line["script_id"])
     return _one_line(conn, line_id)
 
 
@@ -307,32 +315,37 @@ def delete_line(line_id: int, conn=Depends(get_conn)):
 
 
 @router.post("/lines/{line_id}/merge-up")
-def merge_line_up(line_id: int, conn=Depends(get_conn)):
+def merge_line_up(line_id: int, request: Request, conn=Depends(get_conn)):
+    line = _line(conn, line_id)
     try:
-        kept = scripts.merge_up(conn, _line(conn, line_id))
+        kept = scripts.merge_up(conn, line)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    _resync(request, conn, line["script_id"])
     return _one_line(conn, kept)
 
 
 @router.post("/lines/{line_id}/split")
-def split_line(line_id: int, body: SplitIn, conn=Depends(get_conn)):
+def split_line(line_id: int, body: SplitIn, request: Request, conn=Depends(get_conn)):
+    line = _line(conn, line_id)
     try:
-        new_id = scripts.split(conn, _line(conn, line_id), body.at)
+        new_id = scripts.split(conn, line, body.at)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    _resync(request, conn, line["script_id"])
     return {"first": _one_line(conn, line_id), "second": _one_line(conn, new_id)}
 
 
 # --- characters
 
 @router.post("/scripts/{script_id}/characters")
-def add_character(script_id: int, body: CharacterIn, conn=Depends(get_conn)):
+def add_character(script_id: int, body: CharacterIn, request: Request, conn=Depends(get_conn)):
     _script(conn, script_id)
     try:
         character_id = scripts.character_for(conn, script_id, body.name)
     except ValueError:
         raise HTTPException(400, "A name needs at least one letter or number.")
+    _resync(request, conn, script_id)
     c = _character(conn, character_id)
     return {"character_id": character_id, "name": c["name"]}
 
@@ -352,11 +365,12 @@ def rename_character(character_id: int, body: CharacterIn, conn=Depends(get_conn
 
 
 @router.post("/characters/{character_id}/merge")
-def merge_character(character_id: int, body: MergeIn, conn=Depends(get_conn)):
+def merge_character(character_id: int, body: MergeIn, request: Request, conn=Depends(get_conn)):
     source, target = _character(conn, character_id), _character(conn, body.into)
     if source["character_id"] == target["character_id"] or source["script_id"] != target["script_id"]:
         raise HTTPException(400, "Pick a different character from the same script.")
     scripts.merge_characters(conn, source, target)
+    _resync(request, conn, target["script_id"])
     return script_detail(conn, target["script_id"])
 
 

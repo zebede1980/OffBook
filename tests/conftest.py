@@ -73,3 +73,32 @@ def fake_llm(monkeypatch):
     f = Fake()
     monkeypatch.setattr(llm, "FAKE", f)
     return f
+
+
+class FakeTTS:
+    """Stands in for Kokoro: four voices, and 'audio' that records what was asked for."""
+    name = "fake"
+
+    def __init__(self):
+        self.calls = []
+        self.broken = False
+
+    def voices(self):
+        from offbook.tts import Voice
+        return [Voice("bf_emma", "Emma", "British women", "f"), Voice("bf_lily", "Lily", "British women", "f"),
+                Voice("bm_george", "George", "British men", "m"), Voice("bm_lewis", "Lewis", "British men", "m")]
+
+    def synthesize(self, text, voice, speed):
+        from offbook.tts import TTSError
+        self.calls.append((text, voice, speed))
+        if self.broken:
+            raise TTSError("fake engine is down")
+        return f"MP3[{voice}@{speed}]{text}".encode()
+
+
+@pytest.fixture(autouse=True)
+def fake_tts(monkeypatch):
+    from offbook import tts
+    f = FakeTTS()
+    monkeypatch.setattr(tts, "FAKE", f)
+    return f
