@@ -9,7 +9,7 @@ import logging
 import shutil
 import sqlite3
 
-from offbook import audio, db, jobs, llm, parse, tts
+from offbook import attempts, audio, db, jobs, llm, parse, tts
 from offbook.config import Settings
 from offbook.db import now_utc
 
@@ -158,6 +158,7 @@ def create_script(conn: sqlite3.Connection, title: str, profile_id: int | None) 
 
 
 def delete_script(conn: sqlite3.Connection, s: Settings, script_id: int) -> None:
+    attempts.delete_files_for(conn, s, script_id=script_id)
     conn.execute("DELETE FROM script WHERE script_id = ?", (script_id,))
     shutil.rmtree(s.data_dir / "pages" / str(script_id), ignore_errors=True)
 

@@ -5,7 +5,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from offbook import auth
+from offbook import attempts, auth
 from offbook.api.deps import get_conn, require_family
 from offbook.db import now_utc
 
@@ -124,6 +124,7 @@ def delete_profile(profile_id: int, body: DeleteIn, request: Request, conn=Depen
     _get(conn, profile_id)
     if not auth.check_family_password(conn, body.password):
         raise HTTPException(400, "Wrong password.")
+    attempts.delete_files_for(conn, request.app.state.settings, profile_id=profile_id)
     conn.execute("DELETE FROM profile WHERE profile_id = ?", (profile_id,))
     if request.session.get("pid") == profile_id:
         request.session.pop("pid", None)
