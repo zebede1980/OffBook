@@ -3,6 +3,9 @@
   import { page } from '$app/state';
   import { api } from '#lib/api';
   import { ClipPlayer } from '#lib/rehearsal/clips';
+  import { countWords, newState, step, type Verdict } from '#lib/rehearsal/endpoint';
+  import { Listener } from '#lib/rehearsal/listener';
+  import { session } from '#lib/session.svelte';
   import { castHue } from '#lib/text';
   import { errorToast, toast } from '#lib/toast.svelte';
   import type { Rehearsal, RehearsalLine } from '#lib/types';
@@ -24,6 +27,7 @@
   let readMine = $state(false);
   let startAt = $state(0);
   let oneScene = $state(false);
+  let listen = $state(false);
 
   let seq = $state<RehearsalLine[]>([]);
   let idx = $state(0);
@@ -34,6 +38,10 @@
   let gen = 0;
   let advance: (() => void) | null = null;
   let wake: WakeLockSentinel | null = null;
+  let ear: Listener | null = null;
+  // what the microphone makes of the current turn; 'off' when not listening
+  let hear = $state<Verdict['kind'] | 'off'>('off');
+  let progress = $state(0);
 
   const cast = $derived(new Map((data?.characters ?? []).map((c, i) => [c.character_id, { ...c, hue: castHue(i) }])));
   const scenes = $derived((data?.lines ?? []).map((l, i) => ({ l, i })).filter((x) => x.l.kind === 'heading'));
@@ -61,6 +69,7 @@
     try {
       const saved = JSON.parse(localStorage.getItem('offbook.rehearse') ?? '{}');
       if (views.some((v) => v.id === saved.view)) view = saved.view;
+      listen = saved.listen === true;
     } catch {
       // no saved preference; the defaults are fine
     }
@@ -70,6 +79,7 @@
 
   onDestroy(() => {
     gen++;
+    ear?.stop();
     player.close();
     wake?.release().catch(() => {});
     document.removeEventListener('visibilitychange', onVisible);
@@ -101,7 +111,6 @@
 
   async function start() {
     if (!data) return;
-    await player.unlock(); // must happen inside this tap, or phones stay silent
     let end = data.lines.length;
     if (oneScene) {
       // the scene ends at the next heading after its first speech (a title and a scene heading can sit together)
@@ -111,13 +120,36 @@
     }
     seq = data.lines.slice(startAt, end);
     try {
-      localStorage.setItem('offbook.rehearse', JSON.stringify({ view }));
+      localStorage.setItem('offbook.rehearse', JSON.stringify({ view, listen }));
     } catch {
       // private browsing: nothing to remember, nothing lost
+    }
+    await begin();
+  }
+
+  /** Start (or restart) playing `seq` from the top. Must be called from a tap. */
+  async function begin() {
+    await player.unlock(); // must happen inside the tap, or phones stay silent
+    if (listen && data?.mine.length && !readMine && !ear) {
+      // Not awaited: the permission prompt can sit unanswered, and the scene should start regardless.
+      // Until the microphone is ready, turns simply wait for a tap.
+      const l = new Listener();
+      l.start(player.context!)
+        .then(() => {
+          if (phase === 'running') ear = l;
+          else l.stop();
+        })
+        .catch(() => toast("Couldn't use the microphone, so tap when you've said your line."));
     }
     phase = 'running';
     keepAwake();
     run(0);
+  }
+
+  function deaf() {
+    if (ear) ear.onFrame = null;
+    hear = 'off';
+    progress = 0;
   }
 
   const waitForTap = () => new Promise<void>((resolve) => (advance = resolve));
@@ -162,12 +194,31 @@
         }
       } else {
         status = 'yourturn';
+        if (ear && l.mine) {
+          const turn = newState();
+          const words = countWords(l.spoken ?? l.text);
+          const patience = session.profile?.patience ?? 1;
+          hear = 'waiting';
+          ear.onFrame = (prob, ms) => {
+            const v = step(turn, prob, ms, words, patience);
+            // ~30 frames a second arrive; only touch the screen when something visible changes
+            if (v.kind !== hear) hear = v.kind;
+            const p = v.kind === 'pausing' ? Math.round(v.progress * 20) / 20 : 0;
+            if (p !== progress) progress = p;
+            if (v.kind === 'advance') release();
+          };
+        }
         await waitForTap();
+        // a restart (Back, Pause) has already set up the next turn's listener: leave it alone
+        if (my !== gen) return;
+        deaf();
       }
     }
     if (my === gen) {
       phase = 'done';
       wake?.release().catch(() => {});
+      ear?.stop();
+      ear = null;
     }
   }
 
@@ -191,6 +242,7 @@
     gen++;
     player.stop();
     release();
+    deaf();
     status = 'paused';
   }
 
@@ -198,6 +250,9 @@
     gen++;
     player.stop();
     release();
+    deaf();
+    ear?.stop();
+    ear = null;
     wake?.release().catch(() => {});
     phase = 'setup';
     load();
@@ -249,6 +304,7 @@
         </select>
         <label class="tick"><input type="checkbox" bind:checked={oneScene} /> Stop at the end of that scene</label>
         <label class="tick"><input type="checkbox" bind:checked={readMine} /> Read my lines out too (just listening)</label>
+        <label class="tick"><input type="checkbox" bind:checked={listen} disabled={readMine} /> Move on by itself when I've said my line (uses the microphone)</label>
       </section>
 
       {#if data.audio.total === 0}
@@ -268,7 +324,7 @@
     <div class="page done">
       <h1>That's the end.</h1>
       <p class="muted">Nicely done.</p>
-      <button class="btn primary big" onclick={() => { phase = 'running'; keepAwake(); run(0); }}>Go again</button>
+      <button class="btn primary big" onclick={begin}>Go again</button>
       <button class="btn big" onclick={leave}>Change something</button>
       <a class="btn ghost" href="/script/{id}">Back to the script</a>
     </div>
@@ -318,6 +374,11 @@
         </ol>
       {/if}
 
+      {#if myTurn && hear !== 'off'}
+        <p class="ear" class:live={hear === 'speaking'} aria-live="polite">
+          {hear === 'waiting' ? 'Listening…' : hear === 'speaking' ? 'Hearing you' : hear === 'pausing' ? 'Moving on…' : hear === 'thinking' ? 'Take your time' : hear === 'nudge' ? "Stuck? Try Hint, or tap when you've said it." : ''}
+        </p>
+      {/if}
       <div class="controls">
         <button class="btn" onclick={back} aria-label="Back one line">‹ Back</button>
         {#if status === 'paused'}
@@ -326,9 +387,10 @@
           <button class="btn" onclick={pause}>Pause</button>
         {/if}
         {#if myTurn && view !== 'script'}
-          <button class="btn" onclick={() => (hint += HINT_STEP)}>Hint</button>
+          <button class="btn" class:pulse={hear === 'nudge'} onclick={() => (hint += HINT_STEP)}>Hint</button>
         {/if}
-        <button class="btn primary main" class:pulse={myTurn} onclick={next} disabled={status === 'loading'}>
+        <button class="btn primary main" class:pulse={myTurn && hear === 'off'} onclick={next} disabled={status === 'loading'}>
+          {#if progress}<span class="fill" style:width="{progress * 100}%"></span>{/if}
           {status === 'paused' ? 'Carry on' : status === 'yourturn' ? (myTurn ? "I've said it" : 'Next') : status === 'speaking' ? 'Skip' : '…'}
         </button>
       </div>
@@ -378,7 +440,11 @@
   .hinttext { font-size: 1.4rem; margin-top: 1rem !important; }
 
   .controls { display: flex; gap: 0.5rem; align-items: center; padding: 0.6rem 0.75rem calc(0.6rem + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--surface); }
-  .controls .main { flex: 1; min-height: 60px; font-size: 1.1rem; }
+  .controls .main { flex: 1; min-height: 60px; font-size: 1.1rem; position: relative; overflow: hidden; }
+  /* fills left to right during the pause before moving on, so it never comes as a surprise */
+  .fill { position: absolute; inset: 0 auto 0 0; background: rgb(255 255 255 / 0.35); transition: width 80ms linear; }
+  .ear { margin: 0; padding: 0.3rem 0.75rem; text-align: center; font-size: 0.85rem; color: var(--muted); }
+  .ear.live { color: var(--accent); font-weight: 600; }
   .pulse { animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 50% { box-shadow: 0 0 0 8px color-mix(in srgb, var(--accent) 25%, transparent); } }
   @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }

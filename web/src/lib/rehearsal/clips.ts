@@ -15,6 +15,11 @@ export class ClipPlayer {
   /** `volume` 0 plays everything silently at normal speed: for testing the player without making a noise. */
   constructor(private volume = 1) {}
 
+  /** The unlocked audio context, for the microphone listener to share. Null until unlock() has run. */
+  get context(): AudioContext | null {
+    return this.ctx;
+  }
+
   /** Call from a tap handler, before anything is played. */
   async unlock(): Promise<void> {
     if (!this.ctx) {

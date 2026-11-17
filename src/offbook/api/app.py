@@ -48,6 +48,10 @@ def create_app(settings: config.Settings | None = None) -> FastAPI:
 
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
+# Browsers refuse to import a module or compile WebAssembly served with the wrong type, and neither Windows
+# nor a slim Linux image reliably knows these two.
+mimetypes.add_type("text/javascript", ".mjs")
+mimetypes.add_type("application/wasm", ".wasm")
 
 
 def _mount_frontend(app: FastAPI, web_dir: Path) -> None:

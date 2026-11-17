@@ -10,3 +10,4 @@ web/build/
 web/.svelte-kit/
 backups/
 spike/
+web/static/vad/
