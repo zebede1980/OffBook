@@ -8,14 +8,30 @@ services:
     environment:
       OFFBOOK_SECURE_COOKIES: "1"   # nginx terminates TLS, so cookies are HTTPS-only
       KOKORO_URL: http://kokoro-tts:8880
+      ZONOS_URL: http://zonos:1919
+      DEFAULT_TTS_ENGINE: zonos
     volumes:
       - ./data:/data
     ports:
       # Host-only, for direct checks. nginx reaches it as offbook:8000 over nginx-proxy-nw.
       - "127.0.0.1:8091:8000"
     networks:
+      - default                       # to reach zonos
       - nginx-proxy-nw
       - character-generator-network   # where the kokoro-tts container lives (CardGenV2's compose)
+    restart: unless-stopped
+
+  # Zonos3-Mini speech server. Not published on the host: only OffBook talks to it.
+  zonos:
+    build: ./zonos
+    container_name: offbook-zonos
+    image: offbook-zonos:latest
+    init: true
+    networks:
+      - default
+    # leave one of the four cores for everything else on the box while voices are being made
+    cpus: 3
+    mem_limit: 4g
     restart: unless-stopped
 
 networks:

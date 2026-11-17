@@ -1,4 +1,4 @@
-"""Voices, who plays whom, and the audio a rehearsal plays."""
+"""Voices, engines, who plays whom, and the audio a rehearsal plays."""
 
 import sqlite3
 
@@ -21,6 +21,10 @@ class CastingIn(BaseModel):
     character_ids: list[int]
 
 
+class EngineIn(BaseModel):
+    engine: str
+
+
 def _script(conn: sqlite3.Connection, script_id: int) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM script WHERE script_id = ?", (script_id,)).fetchone()
     if row is None:
@@ -28,9 +32,17 @@ def _script(conn: sqlite3.Connection, script_id: int) -> sqlite3.Row:
     return row
 
 
-def _catalogue(request: Request) -> list[tts.Voice]:
+def _engine_name(request: Request, name: str | None) -> str:
+    s = request.app.state.settings
+    name = name or (s.default_engine if s.default_engine in tts.available(s) else "kokoro")
+    if name not in tts.available(s):
+        raise HTTPException(400, "That voice engine isn't available here.")
+    return name
+
+
+def _catalogue(request: Request, engine: str) -> list[tts.Voice]:
     try:
-        return tts.voices(request.app.state.settings)
+        return tts.voices(request.app.state.settings, engine)
     except tts.TTSError:
         raise HTTPException(503, "The voices aren't available right now. Try again in a minute.")
 
@@ -42,18 +54,22 @@ def _mine(conn: sqlite3.Connection, script_id: int, profile_id: int) -> list[int
 
 
 @router.get("/voices")
-def list_voices(request: Request):
-    return {"voices": [{"id": v.id, "label": v.label, "group": v.group} for v in _catalogue(request)]}
+def list_voices(request: Request, engine: str | None = None):
+    name = _engine_name(request, engine)
+    s = request.app.state.settings
+    return {"engine": name,
+            "engines": [{"id": e, "label": tts.LABELS[e]} for e in tts.available(s)],
+            "voices": [{"id": v.id, "label": v.label, "group": v.group} for v in _catalogue(request, name)]}
 
 
 @router.get("/voices/{voice_id}/preview")
-def preview_voice(voice_id: str, request: Request, conn=Depends(get_conn)):
-    """A short sample, made on first request and kept. Slow the first time (a couple of seconds)."""
+def preview_voice(voice_id: str, request: Request, engine: str | None = None, conn=Depends(get_conn)):
+    """A short sample, made on first request and kept. Slow the first time (a few seconds)."""
     s = request.app.state.settings
-    if voice_id not in {v.id for v in _catalogue(request)}:
+    name = _engine_name(request, engine)
+    if voice_id not in {v.id for v in _catalogue(request, name)}:
         raise HTTPException(404, "No such voice.")
-    engine = tts.engine(s).name
-    c = {"hash": audio.clip_hash(engine, voice_id, 1.0, audio.PREVIEW), "engine": engine, "voice": voice_id,
+    c = {"hash": audio.clip_hash(name, voice_id, 1.0, audio.PREVIEW), "engine": name, "voice": voice_id,
          "speed": 1.0, "text": audio.PREVIEW}
     audio.ensure_clip(conn, c, priority=audio.URGENT)
     clip = audio.render(conn, s, c["hash"])
@@ -68,7 +84,8 @@ def set_voice(character_id: int, body: VoiceIn, request: Request, conn=Depends(g
     c = conn.execute("SELECT * FROM character WHERE character_id = ?", (character_id,)).fetchone()
     if c is None:
         raise HTTPException(404, "No such character.")
-    if body.voice is not None and body.voice not in {v.id for v in _catalogue(request)}:
+    engine = audio.script_engine(conn, c["script_id"])
+    if body.voice is not None and body.voice not in {v.id for v in _catalogue(request, engine)}:
         raise HTTPException(400, "Pick one of the voices on offer.")
     conn.execute("UPDATE character SET voice = ?, speed = ? WHERE character_id = ?",
                  (body.voice, round(body.speed, 2), character_id))
@@ -76,14 +93,40 @@ def set_voice(character_id: int, body: VoiceIn, request: Request, conn=Depends(g
     return {"character_id": character_id, "voice": body.voice, "speed": round(body.speed, 2)}
 
 
+@router.put("/scripts/{script_id}/engine")
+def set_engine(script_id: int, body: EngineIn, request: Request, conn=Depends(get_conn)):
+    """Voice the script with another engine. Choices made on the old engine are kept for switching back."""
+    _script(conn, script_id)
+    name = _engine_name(request, body.engine)
+    _catalogue(request, name)
+    s = request.app.state.settings
+    audio.switch_engine(conn, s, script_id, name)
+    return audio.progress(conn, s, script_id)
+
+
 @router.post("/scripts/{script_id}/voices/auto")
 def auto_voices(script_id: int, request: Request, conn=Depends(get_conn)):
     """Give every character without a voice one, and start generating the audio."""
     _script(conn, script_id)
-    _catalogue(request)
+    _catalogue(request, audio.script_engine(conn, script_id))
     s = request.app.state.settings
     assigned = audio.auto_assign(conn, s, script_id)
     return {"assigned": assigned, "queued": audio.sync_clips(conn, s, script_id)}
+
+
+@router.get("/scripts/{script_id}/audio")
+def audio_progress(script_id: int, request: Request, conn=Depends(get_conn)):
+    _script(conn, script_id)
+    return audio.progress(conn, request.app.state.settings, script_id)
+
+
+@router.post("/scripts/{script_id}/audio/retry")
+def retry_audio(script_id: int, request: Request, conn=Depends(get_conn)):
+    """Queue again any clip that failed (and anything missing)."""
+    _script(conn, script_id)
+    s = request.app.state.settings
+    audio.sync_clips(conn, s, script_id)
+    return audio.progress(conn, s, script_id)
 
 
 @router.get("/scripts/{script_id}/casting")
@@ -115,9 +158,12 @@ def rehearsal(script_id: int, request: Request, profile=Depends(current_profile)
     s = request.app.state.settings
     audio.sync_clips(conn, s, script_id)
     clips = audio.line_clips(conn, s, script_id)
-    status = {r["clip_hash"]: r["status"] for r in conn.execute(
-        f"SELECT clip_hash, status FROM clip WHERE clip_hash IN ({','.join('?' * len(clips))})",
-        [c["hash"] for c in clips.values()])} if clips else {}
+    hashes = [c["hash"] for c in clips.values()]
+    status: dict[str, str] = {}
+    for i in range(0, len(hashes), 500):
+        chunk = hashes[i:i + 500]
+        status.update(conn.execute(f"SELECT clip_hash, status FROM clip WHERE clip_hash IN ({','.join('?' * len(chunk))})",
+                                   chunk).fetchall())
     mine = set(_mine(conn, script_id, profile["profile_id"]))
     speakers: dict[int, list[int]] = {}
     for line_id, character_id in conn.execute(
@@ -132,15 +178,13 @@ def rehearsal(script_id: int, request: Request, profile=Depends(current_profile)
                       "spoken": r["spoken"], "speakers": who, "mine": bool(mine & set(who)),
                       "clip": clip["hash"] if clip else None,
                       "clip_status": status.get(clip["hash"]) if clip else None})
-    wanted = [ln for ln in lines if ln["clip"]]
-    return {"script": {"script_id": script["script_id"], "title": script["title"]},
+    return {"script": {"script_id": script["script_id"], "title": script["title"], "engine": script["engine"]},
             "mine": sorted(mine),
             "characters": [{"character_id": c["character_id"], "name": c["name"], "voice": c["voice"]}
                            for c in conn.execute("SELECT * FROM character WHERE script_id = ? ORDER BY character_id",
                                                  (script_id,))],
             "lines": lines,
-            "audio": {"total": len(wanted), "ready": sum(ln["clip_status"] == "done" for ln in wanted),
-                      "failed": sum(ln["clip_status"] == "failed" for ln in wanted)}}
+            "audio": audio.progress(conn, s, script_id)}
 
 
 @router.get("/clips/{clip_hash}")

@@ -1,7 +1,10 @@
 """Voices for the other parts, and the audio generated ahead of time for every spoken line.
 
-Kokoro on the server runs at about real-time, far too slow to synthesise between lines of a rehearsal. So
-every line is voiced in the background as soon as its character has a voice, and rehearsal plays files.
+Speech on the server runs at about real-time, far too slow to synthesise between lines of a rehearsal. So every
+line is voiced in the background as soon as its character has a voice, and rehearsal plays files.
+
+Each script has one engine (Kokoro or Zonos). A character's voice belongs to that engine; switching engine keeps
+the old choice in `saved_voices`, so switching back restores it, and its clips are still on disk.
 """
 
 import hashlib
@@ -10,17 +13,19 @@ import logging
 import re
 import sqlite3
 
-from offbook import jobs, tts
+from offbook import jobs, sound, tts
 from offbook.config import Settings
 from offbook.db import now_utc
 
 log = logging.getLogger(__name__)
 URGENT = 100   # a clip someone is waiting to hear jumps every queue
 PREVIEW = "Hello! This is how I sound when I read a line."
+# Bump when the processing after synthesis changes, so every clip is made again the new way.
+PROCESSING = "level1"
 
 _FEMALE = {"mum", "mummy", "mom", "mother", "mrs", "miss", "ms", "queen", "aunt", "auntie", "aunty", "grandma",
            "granny", "gran", "nan", "nana", "lady", "sister", "girl", "princess", "witch", "woman", "wife",
-           "daughter", "madam", "madame", "dame", "duchess", "fairy", "nurse", "maid", "waitress", "actress"}
+           "daughter", "madam", "madame", "dame", "duchess", "fairy", "nurse", "maid", "waitress", "actress", "alice"}
 _MALE = {"dad", "daddy", "father", "mr", "king", "uncle", "grandpa", "grandad", "granddad", "lord", "brother",
          "boy", "prince", "sir", "man", "husband", "son", "wizard", "duke", "waiter", "butler", "santa"}
 
@@ -36,13 +41,19 @@ def guess_gender(name: str) -> str | None:
 
 
 def clip_hash(engine: str, voice: str, speed: float, text: str) -> str:
-    return hashlib.sha256(f"{engine}\n{voice}\n{speed:.2f}\n{text}".encode()).hexdigest()[:32]
+    return hashlib.sha256(f"{PROCESSING}\n{engine}\n{voice}\n{speed:.2f}\n{text}".encode()).hexdigest()[:32]
+
+
+def script_engine(conn: sqlite3.Connection, script_id: int) -> str:
+    row = conn.execute("SELECT engine FROM script WHERE script_id = ?", (script_id,)).fetchone()
+    return row[0] if row else "kokoro"
 
 
 def auto_assign(conn: sqlite3.Connection, s: Settings, script_id: int) -> int:
     """Give a voice to each character that has none: the right gender where the name gives it away, otherwise
-    alternating, and always the voice least used so far in this script so parts sound different."""
-    catalogue = tts.voices(s)
+    alternating, and always the voice least used so far in this script so parts sound different.
+    Novelty voices (a witch, an announcer) are only ever chosen by hand."""
+    catalogue = tts.voices(s, script_engine(conn, script_id))
     if not catalogue:
         return 0
     used: dict[str, int] = {v.id: 0 for v in catalogue}
@@ -51,19 +62,40 @@ def auto_assign(conn: sqlite3.Connection, s: Settings, script_id: int) -> int:
             used[voice] += 1
     todo = conn.execute("SELECT character_id, name FROM character WHERE script_id = ? AND voice IS NULL "
                         "ORDER BY character_id", (script_id,)).fetchall()
+    everyday = [v for v in catalogue if v.auto] or catalogue
     for n, c in enumerate(todo):
         gender = guess_gender(c["name"]) or "fm"[n % 2]
-        pool = [v for v in catalogue if v.gender == gender] or catalogue
+        pool = [v for v in everyday if v.gender == gender] or everyday
         pick = min(pool, key=lambda v: used[v.id])   # min() keeps the first of equals, i.e. the best-ranked voice
         used[pick.id] += 1
         conn.execute("UPDATE character SET voice = ? WHERE character_id = ?", (pick.id, c["character_id"]))
     return len(todo)
 
 
+def switch_engine(conn: sqlite3.Connection, s: Settings, script_id: int, new: str) -> None:
+    """Move a script to another engine. Each character's current voice is put aside for the old engine, and the
+    voice they last had on the new one (if any, and if it still exists) comes back. The rest get voices as usual."""
+    old = script_engine(conn, script_id)
+    if new == old:
+        return
+    valid = {v.id for v in tts.voices(s, new)}
+    for c in conn.execute("SELECT * FROM character WHERE script_id = ?", (script_id,)).fetchall():
+        saved = json.loads(c["saved_voices"] or "{}")
+        if c["voice"]:
+            saved[old] = {"voice": c["voice"], "speed": c["speed"]}
+        back = saved.get(new) or {}
+        voice = back.get("voice") if back.get("voice") in valid else None
+        conn.execute("UPDATE character SET voice = ?, speed = ?, saved_voices = ? WHERE character_id = ?",
+                     (voice, back.get("speed", 1.0) if voice else 1.0, json.dumps(saved), c["character_id"]))
+    conn.execute("UPDATE script SET engine = ? WHERE script_id = ?", (new, script_id))
+    auto_assign(conn, s, script_id)
+    sync_clips(conn, s, script_id)
+
+
 def line_clips(conn: sqlite3.Connection, s: Settings, script_id: int) -> dict[int, dict]:
     """For each speech that can be voiced: the clip it needs. A speech shared by several characters is read in the
     voice of the first of them that has one."""
-    engine = tts.engine(s).name
+    engine = script_engine(conn, script_id)
     out: dict[int, dict] = {}
     for r in conn.execute(
             """SELECT l.line_id, l.spoken, c.voice, c.speed FROM line l
@@ -103,14 +135,54 @@ def hurry(conn: sqlite3.Connection, clip_hash_: str) -> None:
                  (URGENT, json.dumps({"clip_hash": clip_hash_})))
 
 
+def seconds_per_clip(conn: sqlite3.Connection) -> float:
+    """How long recent clips took to make, for time estimates. A guess of 4 s until there is history."""
+    row = conn.execute(
+        """SELECT AVG((julianday(finished_at) - julianday(started_at)) * 86400), COUNT(*) FROM
+           (SELECT started_at, finished_at FROM job WHERE kind = 'tts' AND status = 'done'
+            AND started_at IS NOT NULL AND finished_at IS NOT NULL ORDER BY job_id DESC LIMIT 30)""").fetchone()
+    return max(0.5, row[0]) if row and row[1] >= 3 and row[0] is not None else 4.0
+
+
+def progress(conn: sqlite3.Connection, s: Settings, script_id: int) -> dict:
+    """How much of a script's audio is ready, and roughly how long the rest will take (including any other
+    script's audio queued ahead of it)."""
+    clips = line_clips(conn, s, script_id)
+    hashes = [c["hash"] for c in clips.values()]
+    status: dict[str, str] = {}
+    for i in range(0, len(hashes), 500):
+        chunk = hashes[i:i + 500]
+        status.update(conn.execute(f"SELECT clip_hash, status FROM clip WHERE clip_hash IN ({','.join('?' * len(chunk))})",
+                                   chunk).fetchall())
+    pending = [h for h in hashes if status.get(h) not in ("done", "failed")]
+    ahead = 0
+    if pending:
+        last = 0
+        for i in range(0, len(pending), 500):
+            chunk = pending[i:i + 500]
+            got = conn.execute(
+                f"""SELECT MAX(job_id) FROM job WHERE kind = 'tts' AND status IN ('queued','running')
+                    AND json_extract(payload, '$.clip_hash') IN ({','.join('?' * len(chunk))})""", chunk).fetchone()[0]
+            last = max(last, got or 0)
+        ahead = conn.execute("SELECT COUNT(*) FROM job WHERE kind = 'tts' AND status IN ('queued','running') "
+                             "AND job_id <= ?", (last,)).fetchone()[0] if last else len(pending)
+    reading = conn.execute("SELECT COUNT(*) FROM page WHERE script_id = ? AND status = 'queued'",
+                           (script_id,)).fetchone()[0]
+    return {"engine": script_engine(conn, script_id), "total": len(hashes),
+            "ready": sum(status.get(h) == "done" for h in hashes),
+            "failed": sum(status.get(h) == "failed" for h in hashes), "pending": len(pending),
+            "eta_seconds": round(max(ahead, len(pending)) * seconds_per_clip(conn)), "reading_pages": reading}
+
+
 def render(conn: sqlite3.Connection, s: Settings, clip_hash_: str) -> sqlite3.Row | None:
-    """Synthesise one clip now and store it. Never raises: a failure is recorded on the clip, and the next
-    sync (or the next person who wants to hear it) queues it again."""
+    """Synthesise one clip now, level it and store it as MP3. Never raises: a failure is recorded on the clip,
+    and the next sync (or the next person who wants to hear it) queues it again."""
     clip = conn.execute("SELECT * FROM clip WHERE clip_hash = ?", (clip_hash_,)).fetchone()
     if clip is None or clip["status"] == "done":
         return clip
     try:
-        data = tts.engine(s).synthesize(clip["text"], clip["voice"], clip["speed"])
+        raw = tts.engine(s, clip["engine"]).synthesize(clip["text"], clip["voice"], clip["speed"])
+        data = sound.level(raw)
         rel = f"audio/{clip_hash_[:2]}/{clip_hash_}.mp3"
         path = s.data_dir / rel
         path.parent.mkdir(parents=True, exist_ok=True)

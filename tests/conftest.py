@@ -76,17 +76,16 @@ def fake_llm(monkeypatch):
 
 
 class FakeTTS:
-    """Stands in for Kokoro: four voices, and 'audio' that records what was asked for."""
-    name = "fake"
+    """Stands in for a speech engine: a few voices, and 'audio' that records what was asked for."""
 
-    def __init__(self):
+    def __init__(self, name, voices):
+        self.name = name
+        self._voices = voices
         self.calls = []
         self.broken = False
 
     def voices(self):
-        from offbook.tts import Voice
-        return [Voice("bf_emma", "Emma", "British women", "f"), Voice("bf_lily", "Lily", "British women", "f"),
-                Voice("bm_george", "George", "British men", "m"), Voice("bm_lewis", "Lewis", "British men", "m")]
+        return self._voices
 
     def synthesize(self, text, voice, speed):
         from offbook.tts import TTSError
@@ -96,9 +95,37 @@ class FakeTTS:
         return f"MP3[{voice}@{speed}]{text}".encode()
 
 
+def _kokoro():
+    from offbook.tts import Voice
+    return FakeTTS("kokoro", [Voice("bf_emma", "Emma", "British women", "f"),
+                              Voice("bf_lily", "Lily", "British women", "f"),
+                              Voice("bm_george", "George", "British men", "m"),
+                              Voice("bm_lewis", "Lewis", "British men", "m")])
+
+
+def _zonos():
+    from offbook.tts import Voice
+    return FakeTTS("zonos", [Voice("z_imogen", "Imogen", "British & Irish women", "f"),
+                             Voice("z_rupert", "Rupert", "British & Irish men", "m"),
+                             Voice("z_cillian", "Cillian", "British & Irish men", "m"),
+                             Voice("z_witch", "Morgana (witch)", "Character voices", "f", auto=False)])
+
+
 @pytest.fixture(autouse=True)
-def fake_tts(monkeypatch):
-    from offbook import tts
-    f = FakeTTS()
-    monkeypatch.setattr(tts, "FAKE", f)
-    return f
+def fake_engines(monkeypatch):
+    """Both engines faked, and levelling (ffmpeg) skipped, for every test."""
+    from offbook import sound, tts
+    engines = {"kokoro": _kokoro(), "zonos": _zonos()}
+    monkeypatch.setattr(tts, "FAKE", engines)
+    monkeypatch.setattr(sound, "level", lambda data: data)
+    return engines
+
+
+@pytest.fixture
+def fake_tts(fake_engines):
+    return fake_engines["kokoro"]
+
+
+@pytest.fixture
+def fake_zonos(fake_engines):
+    return fake_engines["zonos"]

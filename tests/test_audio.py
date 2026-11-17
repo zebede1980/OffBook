@@ -56,7 +56,7 @@ def test_clips_are_generated_in_script_order_from_the_spoken_words(kid, scene, c
     assert fake_tts.calls[3][1] == voices_of(kid, scene["id"])["MUM"]
 
     r = kid.get(f"/api/scripts/{scene['id']}/rehearsal").json()
-    assert r["audio"] == {"total": 4, "ready": 4, "failed": 0}
+    assert (r["audio"]["total"], r["audio"]["ready"], r["audio"]["failed"]) == (4, 4, 0)
     assert [ln["clip_status"] for ln in r["lines"]] == ["done", "done", "done", "done", None]
     clip = kid.get(f"/api/clips/{r['lines'][0]['clip']}")
     assert clip.status_code == 200 and clip.headers["content-type"] == "audio/mpeg"
@@ -103,7 +103,8 @@ def test_tts_down_marks_clips_failed_and_a_later_sync_retries(kid, scene, conn, 
     assert r["audio"]["ready"] == 0
     fake_tts.broken = False
     jobs.run_pending(conn, settings)
-    assert kid.get(f"/api/scripts/{scene['id']}/rehearsal").json()["audio"] == {"total": 4, "ready": 4, "failed": 0}
+    a = kid.get(f"/api/scripts/{scene['id']}/rehearsal").json()["audio"]
+    assert (a["total"], a["ready"], a["failed"]) == (4, 4, 0)
 
 
 def test_preview(kid, fake_tts):

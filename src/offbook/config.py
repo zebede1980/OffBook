@@ -15,6 +15,8 @@ class Settings:
     nanogpt_base_url: str
     parse_model: str
     kokoro_url: str
+    zonos_url: str
+    default_engine: str
     attempt_days: int
     start_worker: bool
 
@@ -49,6 +51,8 @@ def load() -> Settings:
         nanogpt_base_url=os.environ.get("NANOGPT_BASE_URL", "https://nano-gpt.com/api/v1"),
         parse_model=os.environ.get("PARSE_MODEL", "anthropic/claude-haiku-5.5"),
         kokoro_url=os.environ.get("KOKORO_URL", "http://localhost:8880"),
+        zonos_url=os.environ.get("ZONOS_URL", ""),
+        default_engine=os.environ.get("DEFAULT_TTS_ENGINE", "kokoro"),
         attempt_days=int(os.environ.get("ATTEMPT_RETENTION_DAYS", "7")),
         start_worker=_flag("OFFBOOK_WORKER", "1"),
     )
