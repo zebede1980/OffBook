@@ -83,6 +83,11 @@ About 2-3p a sheet.
 ## Not verified
 
 - Zonos voices have only been listened to as the four spike samples; a whole script in Zonos hasn't been heard.
+  Short lines come out brisk ("Where do you want these?" in ~1.2 s). The length is the same across seeds, so it
+  looks like pace rather than dropped words, but listen for clipped endings. If they're too quick, Zonos has a
+  `speaking_rate` condition that could be tried. Its alignment-guarded mode (`laci`) is refused by this model.
+- Clips in production measure -18 LUFS ±0.3 after levelling; Zonos makes one every ~3.2 s (about 16 minutes for
+  the Christmas script).
 - The split-in-halves page reading is tested with synthetic images and a fake AI, not yet on a real stuck page.
 - Microphone listening and recording haven't been tried on a phone.
 
