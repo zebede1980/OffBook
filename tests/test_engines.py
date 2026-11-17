@@ -156,3 +156,14 @@ def test_progress_checks_do_not_retry_failures_forever(kid, scene, conn, setting
     for _ in range(3):
         assert kid.get(f"/api/scripts/{scene['id']}/audio").json()["failed"] == 2
     assert jobs.run_pending(conn, settings) == 0
+
+
+def test_switching_engine_cancels_the_old_engines_unmade_clips(kid, scene, conn, settings, fake_tts, fake_zonos):
+    # the Kokoro clips are queued but not made yet when the script moves to Zonos
+    kid.put(f"/api/scripts/{scene['id']}/engine", json={"engine": "zonos"})
+    jobs.run_pending(conn, settings)
+    assert fake_tts.calls == [] and len(fake_zonos.calls) == 2
+    # and coming back to Kokoro queues them afresh
+    kid.put(f"/api/scripts/{scene['id']}/engine", json={"engine": "kokoro"})
+    jobs.run_pending(conn, settings)
+    assert len(fake_tts.calls) == 2

@@ -78,6 +78,7 @@ def switch_engine(conn: sqlite3.Connection, s: Settings, script_id: int, new: st
     old = script_engine(conn, script_id)
     if new == old:
         return
+    cancel_unmade(conn, [c["hash"] for c in line_clips(conn, s, script_id).values()])
     valid = {v.id for v in tts.voices(s, new)}
     for c in conn.execute("SELECT * FROM character WHERE script_id = ?", (script_id,)).fetchall():
         saved = json.loads(c["saved_voices"] or "{}")
@@ -90,6 +91,19 @@ def switch_engine(conn: sqlite3.Connection, s: Settings, script_id: int, new: st
     conn.execute("UPDATE script SET engine = ? WHERE script_id = ?", (new, script_id))
     auto_assign(conn, s, script_id)
     sync_clips(conn, s, script_id)
+
+
+def cancel_unmade(conn: sqlite3.Connection, hashes: list[str]) -> int:
+    """Drop clips that are queued but not yet made, and their jobs: nobody needs them any more. A clip another
+    script still wants is simply queued again by that script's next sync."""
+    n = 0
+    for i in range(0, len(hashes), 500):
+        chunk = hashes[i:i + 500]
+        marks = ",".join("?" * len(chunk))
+        conn.execute(f"""DELETE FROM job WHERE kind = 'tts' AND status = 'queued'
+                         AND json_extract(payload, '$.clip_hash') IN ({marks})""", chunk)
+        n += conn.execute(f"DELETE FROM clip WHERE status = 'queued' AND clip_hash IN ({marks})", chunk).rowcount
+    return n
 
 
 def line_clips(conn: sqlite3.Connection, s: Settings, script_id: int) -> dict[int, dict]:
