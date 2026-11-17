@@ -14,6 +14,39 @@
   let name = $state('');
   let colour = $state('');
   let busy = $state(false);
+  let managing = $state(false);
+  let removing = $state<number | null>(null);
+  let password = $state('');
+
+  const paces = [
+    { value: 0.7, label: 'Quick' },
+    { value: 1, label: 'Normal' },
+    { value: 1.5, label: 'Patient' },
+    { value: 2, label: 'Very patient' }
+  ];
+
+  async function change(p: Profile, patch: Partial<Pick<Profile, 'name' | 'patience'>>) {
+    try {
+      const updated = await api.patch<Profile>(`/api/profiles/${p.profile_id}`, patch);
+      profiles = profiles.map((x) => (x.profile_id === updated.profile_id ? updated : x));
+      if (session.profile?.profile_id === updated.profile_id) session.profile = updated;
+    } catch (e) {
+      errorToast(e);
+      profiles = [...profiles]; // put the old name back in the box
+    }
+  }
+
+  async function remove(e: SubmitEvent) {
+    e.preventDefault();
+    try {
+      await api.post(`/api/profiles/${removing}/delete`, { password });
+      profiles = profiles.filter((x) => x.profile_id !== removing);
+      if (session.profile?.profile_id === removing) session.profile = null;
+      removing = null;
+    } catch (err) {
+      errorToast(err);
+    }
+  }
 
   onMount(async () => {
     try {
@@ -101,6 +134,40 @@
       </form>
     {/if}
 
+    {#if profiles.length}
+      <button class="btn ghost small" onclick={() => (managing = !managing)}>{managing ? 'Done' : 'Change names and settings'}</button>
+    {/if}
+
+    {#if managing}
+      <div class="manage">
+        {#each profiles as p (p.profile_id)}
+          <div class="card mrow">
+            <div class="row">
+              <Avatar name={p.name} colour={p.colour} size={36} />
+              <input type="text" maxlength="24" aria-label="Name" value={p.name} onchange={(e) => change(p, { name: e.currentTarget.value })} />
+            </div>
+            <label for="pace{p.profile_id}">When listening for the end of a line, wait</label>
+            <select id="pace{p.profile_id}" value={p.patience} onchange={(e) => change(p, { patience: Number(e.currentTarget.value) })}>
+              {#each paces as o}<option value={o.value}>{o.label}</option>{/each}
+            </select>
+            {#if removing === p.profile_id}
+              <form onsubmit={remove}>
+                <label for="rp">Family password, to remove {p.name} and their progress</label>
+                <input id="rp" type="password" autocomplete="current-password" bind:value={password} required />
+                <div class="row">
+                  <button class="btn danger" type="submit">Remove {p.name}</button>
+                  <button class="btn ghost" type="button" onclick={() => (removing = null)}>Keep</button>
+                </div>
+              </form>
+            {:else}
+              <button class="btn ghost small danger" onclick={() => { password = ''; removing = p.profile_id; }}>Remove</button>
+            {/if}
+          </div>
+        {/each}
+        <p class="small muted"><a href="/selftest">Listening self-test</a></p>
+      </div>
+    {/if}
+
     <button class="btn ghost small out" onclick={logout}>Log out of OffBook</button>
   </main>
 {/if}
@@ -116,5 +183,10 @@
   .swatches { display: flex; flex-wrap: wrap; gap: 0.6rem; }
   .swatch { width: 44px; height: 44px; border-radius: 50%; margin: 0; cursor: pointer; border: 3px solid transparent; }
   .swatch.on { border-color: var(--text); box-shadow: 0 0 0 2px var(--surface) inset; }
-  .out { margin-top: 2.5rem; color: var(--muted); }
+  .out { display: block; margin: 2.5rem auto 0; color: var(--muted); }
+  .manage { text-align: left; margin-top: 1rem; }
+  .mrow { padding: 0.9rem; margin-bottom: 0.75rem; }
+  .mrow input[type='text'] { flex: 1; min-width: 0; }
+  .mrow .row { margin-top: 0.6rem; }
+  .mrow .row:first-child { margin-top: 0; }
 </style>
