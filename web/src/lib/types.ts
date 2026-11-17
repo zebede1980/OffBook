@@ -34,6 +34,14 @@ export interface Character {
   character_id: number;
   name: string;
   lines: number;
+  voice: string | null;
+  speed: number;
+}
+
+export interface Voice {
+  id: string;
+  label: string;
+  group: string;
 }
 
 export interface Line {
@@ -53,4 +61,24 @@ export interface ScriptDetail {
   pages: Page[];
   characters: Character[];
   lines: Line[];
+}
+
+export interface RehearsalLine {
+  line_id: number;
+  seq: number;
+  kind: Kind;
+  text: string;
+  spoken: string | null;
+  speakers: number[];
+  mine: boolean;
+  clip: string | null;
+  clip_status: 'queued' | 'done' | 'failed' | null;
+}
+
+export interface Rehearsal {
+  script: { script_id: number; title: string };
+  mine: number[];
+  characters: { character_id: number; name: string; voice: string | null }[];
+  lines: RehearsalLine[];
+  audio: { total: number; ready: number; failed: number };
 }

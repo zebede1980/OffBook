@@ -6,7 +6,7 @@
   import { shrinkImage } from '#lib/images';
   import { castHue, segments } from '#lib/text';
   import { errorToast, toast } from '#lib/toast.svelte';
-  import type { Character, Kind, Line, ScriptDetail } from '#lib/types';
+  import type { Character, Kind, Line, ScriptDetail, Voice } from '#lib/types';
 
   const id = Number(page.params.id);
   const kinds: { id: Kind; label: string }[] = [
@@ -35,6 +35,9 @@
   let mergeTo = $state(0);
   let deleting = $state(false);
   let password = $state('');
+  let voices = $state<Voice[]>([]);
+  let mine = $state<number[]>([]);
+  let sample: HTMLAudioElement | null = null;
 
   const cast = $derived(
     new Map((detail?.characters ?? []).map((c, i) => [c.character_id, { ...c, hue: castHue(i) }]))
@@ -62,8 +65,45 @@
     }
   }
 
-  onMount(load);
-  onDestroy(() => clearTimeout(timer));
+  onMount(() => {
+    load();
+    // the cast tab's extras; the script is usable without them, so a failure here is not shown as an error
+    api.get<{ voices: Voice[] }>('/api/voices').then((r) => (voices = r.voices)).catch(() => {});
+    api.get<{ character_ids: number[] }>(`/api/scripts/${id}/casting`).then((r) => (mine = r.character_ids)).catch(() => {});
+  });
+  onDestroy(() => {
+    clearTimeout(timer);
+    sample?.pause();
+  });
+
+  const voiceGroups = $derived(
+    [...new Set(voices.map((v) => v.group))].map((g) => ({ group: g, voices: voices.filter((v) => v.group === g) }))
+  );
+
+  async function setVoice(c: Character, voice: string) {
+    try {
+      await api.patch(`/api/characters/${c.character_id}/voice`, { voice: voice || null, speed: c.speed });
+      await load();
+    } catch (err) {
+      errorToast(err);
+    }
+  }
+
+  function playSample(voice: string | null) {
+    if (!voice) return;
+    sample?.pause();
+    sample = new Audio(`/api/voices/${voice}/preview`);
+    sample.play().catch(() => toast("Couldn't play that voice just now."));
+  }
+
+  async function toggleMine(c: Character) {
+    const next = mine.includes(c.character_id) ? mine.filter((x) => x !== c.character_id) : [...mine, c.character_id];
+    try {
+      mine = (await api.put<{ character_ids: number[] }>(`/api/scripts/${id}/casting`, { character_ids: next })).character_ids;
+    } catch (err) {
+      errorToast(err);
+    }
+  }
 
   async function addPages(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
@@ -252,6 +292,8 @@
       </div>
     {/if}
 
+    {#if detail.lines.length}<a class="btn primary go" href="/script/{id}/rehearse">Rehearse</a>{/if}
+
     <div class="strip">
       {#each detail.pages as p (p.page_id)}
         <button class="thumb" onclick={() => showPhoto(p.page_id)} aria-label="Page {p.seq}{p.status === 'failed' ? ', has a problem' : ''}">
@@ -355,11 +397,27 @@
       </ol>
     {:else}
       {#each detail.characters as c, i (c.character_id)}
-        <div class="card castrow">
-          <span class="dot" style:--h={castHue(i)}></span>
-          <input type="text" maxlength="40" aria-label="Character name" value={c.name} onchange={(e) => renameCharacter(c, e.currentTarget.value)} />
-          <span class="muted small count">{c.lines} line{c.lines === 1 ? '' : 's'}</span>
-          {#if c.lines === 0}<button class="btn small danger" onclick={() => deleteCharacter(c)}>Remove</button>{/if}
+        <div class="card castrow" class:me={mine.includes(c.character_id)}>
+          <div class="row">
+            <span class="dot" style:--h={castHue(i)}></span>
+            <input type="text" maxlength="40" aria-label="Character name" value={c.name} onchange={(e) => renameCharacter(c, e.currentTarget.value)} />
+            <span class="muted small count">{c.lines} line{c.lines === 1 ? '' : 's'}</span>
+            {#if c.lines === 0}<button class="btn small danger" onclick={() => deleteCharacter(c)}>Remove</button>{/if}
+          </div>
+          <div class="row">
+            <button class="btn small mebtn" aria-pressed={mine.includes(c.character_id)} class:on={mine.includes(c.character_id)} onclick={() => toggleMine(c)}>
+              {mine.includes(c.character_id) ? "That's me" : 'This is me'}
+            </button>
+            <select aria-label="Voice for {c.name}" value={c.voice ?? ''} onchange={(e) => setVoice(c, e.currentTarget.value)}>
+              <option value="">No voice</option>
+              {#each voiceGroups as g}
+                <optgroup label={g.group}>
+                  {#each g.voices as v}<option value={v.id}>{v.label}</option>{/each}
+                </optgroup>
+              {/each}
+            </select>
+            <button class="btn small" aria-label="Hear {c.name}'s voice" disabled={!c.voice} onclick={() => playSample(c.voice)}>▶</button>
+          </div>
         </div>
       {:else}
         <div class="card empty"><p>Characters appear here once some pages have been read.</p></div>
@@ -463,8 +521,13 @@
   .editor .row { margin-top: 0.6rem; flex-wrap: wrap; }
   .more { padding-top: 0.6rem; border-top: 1px solid var(--line); }
 
-  .castrow { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; }
+  .castrow { display: grid; gap: 0.5rem; padding: 0.6rem 0.75rem; margin-bottom: 0.5rem; }
+  .castrow.me { border-color: var(--accent); }
   .castrow input { flex: 1; min-width: 0; min-height: 40px; }
+  .castrow select { flex: 1; min-width: 0; min-height: 40px; }
+  .mebtn { white-space: nowrap; }
+  .mebtn.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  .go { width: 100%; margin: 0.25rem 0 0.25rem; }
   .dot { width: 14px; height: 14px; border-radius: 50%; flex: none; background: hsl(var(--h) 55% 50%); }
   .count { white-space: nowrap; }
   .mergebox { padding: 1rem; margin-top: 1rem; }
