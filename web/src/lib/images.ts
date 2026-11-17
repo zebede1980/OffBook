@@ -4,8 +4,18 @@ const MAX_EDGE = 2000;
 const MAX_BYTES = 3_300_000;
 
 export async function shrinkImage(file: File): Promise<Blob> {
-  // 'from-image' applies the camera's rotation flag, so a portrait photo stays portrait
-  const bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  let bitmap: ImageBitmap;
+  try {
+    // 'from-image' applies the camera's rotation flag, so a portrait photo stays portrait
+    bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  } catch {
+    // Desktop Chrome and Firefox can't decode iPhone HEIC files; Safari on the phone converts them itself
+    throw new Error(
+      /\.hei[cf]$/i.test(file.name)
+        ? `${file.name} is an iPhone HEIC photo, which this browser can't open. Add it from the phone instead.`
+        : `Couldn't open ${file.name}. Is it a photo?`
+    );
+  }
   const scale = Math.min(1, MAX_EDGE / Math.max(bitmap.width, bitmap.height));
   const canvas = document.createElement('canvas');
   canvas.width = Math.round(bitmap.width * scale);
